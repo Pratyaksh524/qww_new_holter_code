@@ -786,8 +786,6 @@ class Dashboard(QWidget):
         self.holter_btn.setStyleSheet("background: #008000; color: white; border-radius: 16px; padding: 8px 24px; font-weight: bold;")
         self.holter_btn.clicked.connect(self.open_holter_from_dashboard)
         self.holter_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.holter_btn.setEnabled(False)
-        self.holter_btn.setVisible(False)
         greet_row.addWidget(self.holter_btn)
 
         # --- Add Chatbot Button ---
@@ -4556,8 +4554,7 @@ class Dashboard(QWidget):
     
     def update_live_conclusion(self):
         """Generate comprehensive personalized conclusion based on current ECG metrics with detailed BPM analysis"""
-        # Allow interpretation if device is connected OR ECG is active (demo / serial running)
-        if not getattr(self, "device_connected", False) and not self.is_ecg_active():
+        if not getattr(self, "device_connected", False):
             return
         
         # Only reset interpretation when both primary limb leads are off.
@@ -6779,11 +6776,16 @@ class Dashboard(QWidget):
         
     def open_hyperkalemia_test(self):
         """Open Hyperkalemia Test window in a new window"""
-        # Stop 12-lead test cleanly before opening Hyperkalemia test
+        # Stop 12-lead test AND Holter recording cleanly before opening Hyperkalemia test
         try:
             ecg_page = getattr(self, 'ecg_test_page', None)
-            if ecg_page and hasattr(ecg_page, 'stop_acquisition'):
-                ecg_page.stop_acquisition()
+            if ecg_page:
+                # Stop acquisition first
+                if hasattr(ecg_page, 'stop_acquisition'):
+                    ecg_page.stop_acquisition()
+                # Stop Holter recording if active
+                if hasattr(ecg_page, 'stop_holter_recording'):
+                    ecg_page.stop_holter_recording()
         except Exception as e:
             print(f" Error stopping 12-lead test: {e}")
 
@@ -6812,11 +6814,16 @@ class Dashboard(QWidget):
     
     def open_hrv_test(self):
         """Open HRV Test window in a new window"""
-        # Stop 12-lead test cleanly before opening HRV test
+        # Stop 12-lead test AND Holter recording cleanly before opening HRV test
         try:
             ecg_page = getattr(self, 'ecg_test_page', None)
-            if ecg_page and hasattr(ecg_page, 'stop_acquisition'):
-                ecg_page.stop_acquisition()
+            if ecg_page:
+                # Stop acquisition first
+                if hasattr(ecg_page, 'stop_acquisition'):
+                    ecg_page.stop_acquisition()
+                # Stop Holter recording if active
+                if hasattr(ecg_page, 'stop_holter_recording'):
+                    ecg_page.stop_holter_recording()
         except Exception as e:
             print(f" Error stopping 12-lead test: {e}")
 

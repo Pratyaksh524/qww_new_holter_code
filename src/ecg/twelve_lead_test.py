@@ -7457,6 +7457,17 @@ class ECGTestPage(QWidget):
         self._lead_data_received = False
         self._set_lead_status_idle()
 
+    def stop_holter_recording(self):
+        """Public wrapper to stop Holter recording when user switches to HRV or Hyperkalemia tests"""
+        if self.holter_mode_enabled:
+            try:
+                self._stop_holter_session_internal()
+                print("[ECGTestPage] Holter recording stopped by user action (switched to HRV/Hyperkalemia)")
+            except Exception as e:
+                print(f"[ECGTestPage] Error stopping Holter recording: {e}")
+            finally:
+                self.holter_mode_enabled = False
+
     def update_plot(self):
         print(f"[DEBUG] ECGTestPage - update_plot called, serial_reader exists: {self.serial_reader is not None}")
         
@@ -9913,9 +9924,18 @@ class ECGTestPage(QWidget):
         self._holter_ui.activateWindow()
 
     def start_live_holter_from_dashboard(self):
-        """Automatically enable Holter mode and start acquisition"""
+        """Automatically enable Holter mode and start acquisition in inner dashboard"""
         if not HOLTER_AVAILABLE:
             return
+
+        # CRITICAL: Clean up any stale HolterMainWindow from previous "View Recording" session
+        # This ensures we always show the inner dashboard (ECG control panel), not a review window
+        if self._holter_ui is not None:
+            try:
+                self._holter_ui.close()
+            except Exception:
+                pass
+            self._holter_ui = None
 
         # 1. Enable Holter Mode
         self.holter_mode_enabled = True
@@ -9948,8 +9968,9 @@ class ECGTestPage(QWidget):
             QMessageBox.warning(self, "Holter Monitor", "Holter module is not available.")
             return
 
-        # If Holter is already armed, reopen the same workspace immediately.
-        if self.holter_mode_enabled and self._holter_ui is not None:
+        # If Holter is already armed AND currently recording (not a stale review window), reopen it
+        if (self.holter_mode_enabled and self._holter_ui is not None and 
+            self._holter_writer and self._holter_writer.is_running):
             self._holter_ui.showMaximized()
             self._holter_ui.raise_()
             self._holter_ui.activateWindow()
