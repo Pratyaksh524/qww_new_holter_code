@@ -5,8 +5,10 @@ Includes offline queue support for automatic sync when internet is restored
 """
 
 import os
+import re
 import json
 import requests
+
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -1008,9 +1010,11 @@ class CloudUploader:
             machine_serial_dir = machine_serial_clean[-4:] if len(machine_serial_clean) >= 4 else "0000"
             
             # S3 prefix and keys with patient name and report_id for easy identification
+            pdf_filename = os.path.basename(pdf_path) if pdf_path else f"{sanitized_name}_{report_id}.pdf"
             s3_prefix = f"reports/{year}/{month}/{day}/{machine_serial_dir}/{report_id}"
             package_s3_key = f"{s3_prefix}/{sanitized_name}_{report_id}.json"
-            pdf_s3_key = f"{s3_prefix}/{sanitized_name}_{report_id}.pdf"
+            pdf_s3_key = f"{s3_prefix}/{pdf_filename}"
+
             
             # Convenience custom metadata headers (Step 7)
             custom_metadata = {
@@ -1521,6 +1525,21 @@ class CloudUploader:
                 "message": f"Failed to clear upload log: {str(e)}"
             }
     
+    def get_registered_doctors(self):
+        """Fetch active doctor list from the AWS doctor endpoint."""
+        try:
+            url = self.doctor_review_api_url or "https://6jhix49qt6.execute-api.us-east-1.amazonaws.com/api/doctor/upload"
+            headers = {}
+            if self.doctor_review_api_key:
+                headers['x-api-key'] = self.doctor_review_api_key
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("doctors") or data.get("data") or []
+        except Exception as e:
+            print(f"[CloudUploader] Error", "No Internet Connection is available, Could not fetch available doctors list.: {e}")
+        return []
+
     def send_for_doctor_review(self, file_path, doctor_name, metadata=None):
         """
         Send ECG/Analysis report for doctor review.
@@ -1561,7 +1580,25 @@ class CloudUploader:
             report_type  = (meta.get('report_type') or "ECG").lower()
             filename     = os.path.basename(file_path)
 
+            # ── Auto-resolve doctor name against registered doctor list ────────
+            resolved_doctor = doctor_name
+            try:
+                doctors = self.get_registered_doctors() or []
+                clean_target = re.sub(r"^dr[._\s]*", "", str(doctor_name or "").strip().lower()).replace("_", "").replace(" ", "")
+                for doc in doctors:
+                    dname = str(doc.get("doctor_name", "") or "")
+                    clean_doc = re.sub(r"^dr[._\s]*", "", dname.strip().lower()).replace("_", "").replace(" ", "")
+                    if clean_target and (clean_target == clean_doc or clean_target in clean_doc or clean_doc in clean_target):
+                        resolved_doctor = dname
+                        print(f"  → Resolved doctor name '{doctor_name}' → official API doctor '{resolved_doctor}'")
+                        break
+            except Exception as de:
+                print(f"  → Doctor name resolution skipped: {de}")
+            doctor_name = resolved_doctor
+
             print(f"🔹 Sending report for review → {endpoint} | doctor={doctor_name} | type={report_type} | file={filename}")
+
+
 
             # ── Resolve device serial ──────────────────────────────────────────
             RhythmUltra_serial = ""
@@ -1581,12 +1618,41 @@ class CloudUploader:
             if not RhythmUltra_serial:
                 RhythmUltra_serial = "DM ECG V1.0 A010"
 
-            _ser_clean = ''.join(c for c in RhythmUltra_serial if c.isalnum())
-            device_id_short = _ser_clean[-4:] if len(_ser_clean) >= 4 else (_ser_clean or "0000")
+            # Extract device_id_short from the filename first (same regex as Lambda server).
+            # This ensures the deviceId we send matches what the Lambda extracts from the
+            # filename, making findReportByFileIdentity succeed.
+            import re as _re
+            _fn_match = _re.search(
+                r'([A-Z0-9]{2,20})_(\d{8})_(\d{6})\.pdf$',
+                filename,
+                _re.IGNORECASE,
+            )
+            if _fn_match:
+                device_id_short = _fn_match.group(1).upper()
+                print(f"  → deviceId from filename regex: {device_id_short}")
+            else:
+                _ser_clean = ''.join(c for c in RhythmUltra_serial if c.isalnum())
+                device_id_short = _ser_clean[-4:] if len(_ser_clean) >= 4 else (_ser_clean or "0000")
 
             api_headers = {}
             if self.doctor_review_api_key:
                 api_headers['x-api-key'] = self.doctor_review_api_key
+
+            # Proactively ensure the PDF report package is uploaded to S3
+            # so AWS S3 ingestion indexes the report into ecg_reports before doctor assignment.
+            try:
+                print("  → Ensuring complete report package is on S3 for doctor review DB indexing...")
+                self.upload_complete_report_package(
+                    pdf_path=file_path,
+                    patient_data={"patient_name": patient_name, "name": patient_name},
+                    ecg_data_file=None,
+                    report_metadata=metadata or {},
+                    report_type=report_type,
+                )
+            except Exception as _pro_e:
+                print(f"  → Proactive upload attempt note: {_pro_e}")
+
+
 
             # ══════════════════════════════════════════════════════════════════
             # MODE A — JSON two-step flow (new Lambda)
@@ -1713,10 +1779,81 @@ class CloudUploader:
                                          {"type": "doctor_review", "doctor": doctor_name})
                         return {"status": "success", "message": "Report sent for review successfully"}
 
+                elif mp_resp.status_code == 404:
+                    # ── REPORT NOT YET IN CLOUD DB ─────────────────────────────
+                    # The Lambda needs the report in ecg_reports before assignment.
+                    # Trigger an immediate cloud sync upload of this PDF, wait for
+                    # ingestion, then retry once.
+                    _err_body = {}
+                    try:
+                        _err_body = mp_resp.json()
+                    except Exception:
+                        pass
+                    _is_not_found = (
+                        "not found" in str(_err_body.get("message", "") or "").lower()
+                        or "not found" in str(_err_body.get("error", {}).get("message", "")).lower()
+                        or "old report" in mp_resp.text.lower()
+                        or "report_not_found" in mp_resp.text.lower()
+                    )
+                    if _is_not_found:
+                        print("  → Report not yet in cloud DB — triggering immediate sync upload & retry...")
+                        try:
+                            _synced = self.upload_complete_report_package(
+                                pdf_path=file_path,
+                                patient_data={"patient_name": patient_name, "name": patient_name},
+                                ecg_data_file=None,
+                                report_metadata=metadata or {},
+                                report_type=report_type,
+                            )
+                            print(f"  → Sync upload result: {_synced}")
+                            import time as _t
+                            _t.sleep(3)  # give DB ingestion a moment
+                        except Exception as _sync_err:
+                            print(f"  → Sync upload failed: {_sync_err}")
+                        # Retry MODE-B once after sync
+                        print(f"  → [MODE-B RETRY] multipart POST for {filename}")
+                        with open(file_path, 'rb') as f:
+                            files2 = {"pdfFile": (filename, f, "application/pdf")}
+                            mp_resp2 = requests.post(
+                                endpoint,
+                                data=form_data,
+                                files=files2,
+                                headers=api_headers,
+                                timeout=60,
+                            )
+                        print(f"  ← [MODE-B RETRY] status={mp_resp2.status_code}  body={mp_resp2.text[:300]}")
+                        if mp_resp2.status_code in (200, 201):
+                            try:
+                                mp_data2 = mp_resp2.json()
+                            except Exception:
+                                mp_data2 = {}
+                            mp_url2 = mp_data2.get("uploadUrl")
+                            if mp_url2:
+                                print("  → [MODE-B RETRY] PUTting PDF to presigned S3 URL…")
+                                with open(file_path, 'rb') as f:
+                                    put3 = requests.put(mp_url2, data=f,
+                                                        headers={"Content-Type": "application/pdf"},
+                                                        timeout=120)
+                                if put3.status_code in (200, 204):
+                                    self._log_upload(file_path, {"status": "success"},
+                                                     {"type": "doctor_review", "doctor": doctor_name})
+                                    return {"status": "success", "message": "Report sent for review successfully"}
+                            if mp_data2.get("success") is True or mp_data2.get("status") == "success":
+                                print("[OK] Report sent via multipart retry")
+                                self._log_upload(file_path, {"status": "success"},
+                                                 {"type": "doctor_review", "doctor": doctor_name})
+                                return {"status": "success", "message": "Report sent for review successfully"}
+                        mp_resp = mp_resp2  # use retry response for final error
+
+                # Handle HTTP 409 (Report already assigned to this doctor)
+                if mp_resp.status_code == 409:
+                    return {"status": "success", "message": "Report has already been sent to this doctor for review."}
+
                 # Both modes failed — return the most recent error
                 err_text = mp_resp.text if _needs_multipart else step1_resp.text
                 err_code = mp_resp.status_code if _needs_multipart else step1_resp.status_code
                 return {"status": "error", "message": f"Upload failed ({err_code}): {err_text[:200]}"}
+
 
             # Neither mode returned a success
             return {
