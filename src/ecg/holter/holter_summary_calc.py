@@ -180,6 +180,10 @@ def get_template_beats_for_badges(beats: List[Dict[str, Any]], arrhythmias: List
     Filters out secondary morphologies and interval labels (e.g. Long QT, AV Blocks).
     """
     badges = []
+    # Manual annotations already have their own display path in the UI and
+    # report generator. Keep this helper focused on auto-detected beats so we
+    # do not turn user-entered S/V marks into synthetic SVT/VT run badges.
+    auto_beats = [beat for beat in beats if not beat.get('is_manual', False)]
     
     # 1. Add strictly major rhythm events from arrhythmias (AFib, AFlutter, VFib, VTach)
     for ev in arrhythmias:
@@ -210,9 +214,9 @@ def get_template_beats_for_badges(beats: List[Dict[str, Any]], arrhythmias: List
             })
             
     # 2. Add individual significant ectopic beats with rhythm context and interval data
-    label_beat_sequences(beats)
+    label_beat_sequences(auto_beats)
     
-    for beat in beats:
+    for beat in auto_beats:
         code = beat.get('short_code', '')
         if code not in ['V', 'S', 'P']:
             continue
@@ -255,3 +259,4 @@ def get_template_beats_for_badges(beats: List[Dict[str, Any]], arrhythmias: List
             
     badges.sort(key=lambda x: x['timestamp'])
     return badges
+
