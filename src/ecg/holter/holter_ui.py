@@ -3321,6 +3321,8 @@ class ECGStripCanvas(QWidget):
                     
                 ev_lbl = str(ev.get('label', '')).lower()
                 ev_lbl_orig = str(ev.get('label', ''))
+                source = str(ev.get('source', '')).lower()
+                is_manual_structured = source in {'manual', 'manual_parallel_multi', 'restored_parallel_multi'}
 
                 # Check if this event starts an arrhythmia
                 active_label = 'N'
@@ -3392,7 +3394,7 @@ class ECGStripCanvas(QWidget):
                         # Determine if this arrhythmia should color the whole region or just QRS complexes.
                         # Asystole, Artifact, and Ventricular Fibrillation lack normal QRS and should color the whole region.
                         # Tachycardia, Bradycardia, AFib, PVC, PAC etc. should color ONLY the QRS complexes.
-                        color_whole_region = ('ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl or 
+                        color_whole_region = is_manual_structured and ('ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl or 
                                               'asystole' in ev_lbl or 'artifact' in ev_lbl or active_label == 'X')
                         
                         r_peak_tss = []
@@ -3412,7 +3414,7 @@ class ECGStripCanvas(QWidget):
                         # Find peaks inside this region
                         region_peaks = [ts for ts in r_peak_tss if region_start_ts <= ts <= region_end_ts]
                         
-                        if color_whole_region or not region_peaks:
+                        if color_whole_region or (not region_peaks and is_manual_structured):
                             # Color the entire region (fallback for no peaks, or explicitly requested for X / VFib)
                             start_idx = max(0, int((region_start_ts - self._start_sec) * self._fs))
                             end_idx = min(len(d) - 1, int((region_end_ts - self._start_sec) * self._fs))
