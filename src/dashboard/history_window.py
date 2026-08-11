@@ -957,7 +957,7 @@ class HistoryWindow(QDialog):
             return sc
 
         _sc("Ctrl+P", self._preview_selected)                      # Preview
-        _sc("Ctrl+E", self._send_email)                            # Email
+        # _sc("Ctrl+E", self._send_email)                          # Email (hidden)
         _sc("Ctrl+O", self._open_in_system)                        # Open in viewer
         _sc("Ctrl+F", lambda: self.search_input.setFocus())        # Focus search
         _sc("F5",     self.load_history)                           # Refresh table
@@ -1734,7 +1734,6 @@ class HistoryWindow(QDialog):
                     "Loading reviewed reports",
                     "You can still browse local reports and queued items while offline.",
                 ),
-                details=str(e),
             )
         except Exception as e:
             self.rev_status_lbl.setStyleSheet("color:#b91c1c;font-size:11px;font-weight:600;")
@@ -1963,7 +1962,7 @@ class HistoryWindow(QDialog):
             return b
 
         btn("Preview",        self._preview_selected)
-        btn("Email",           self._send_email)
+        # btn("Email",           self._send_email)
         btn("Open Report",     self._open_in_system,      secondary=True)
         btn("Send for Review", self.send_report_for_review)
         btn("Export All",      self.export_all_reports,   secondary=True)
@@ -2514,19 +2513,19 @@ class HistoryWindow(QDialog):
         else:
             QMessageBox.information(self, "Not Found", "No local PDF found for this entry.")
 
-    def _send_email(self):
-        row = self.table.currentRow()
-        if row < 0:
-            QMessageBox.information(self, "Send Email", "Select a report row first.")
-            return
-        rf = self._get_report_file(row)
-        if not rf or not os.path.exists(rf):
-            QMessageBox.warning(self, "Send Email", "No local PDF found for this entry.")
-            return
-        pi = self.table.item(row, 4)
-        pname = pi.text() if pi else ""
-        dlg = SendEmailDialog(rf, patient_name=pname, parent=self)
-        dlg.exec_()
+    # def _send_email(self):
+    #     row = self.table.currentRow()
+    #     if row < 0:
+    #         QMessageBox.information(self, "Send Email", "Select a report row first.")
+    #         return
+    #     rf = self._get_report_file(row)
+    #     if not rf or not os.path.exists(rf):
+    #         QMessageBox.warning(self, "Send Email", "No local PDF found for this entry.")
+    #         return
+    #     pi = self.table.item(row, 4)
+    #     pname = pi.text() if pi else ""
+    #     dlg = SendEmailDialog(rf, patient_name=pname, parent=self)
+    #     dlg.exec_()
 
     # ── status context menu ───────────────────────────────────────────────
     def _show_status_menu(self, row):
@@ -2697,7 +2696,7 @@ class HistoryWindow(QDialog):
             uploader = get_cloud_uploader()
             doctors = uploader.get_available_doctors()
             if not doctors:
-                QMessageBox.warning(self, "Error", "Could not fetch doctor list.")
+                QMessageBox.warning(self, "Error", "No Internet Connection is availabe. Could not fetch available doctors list.")
                 return
             pi = self.table.item(row, 3)
             current_doc = pi.text() if pi else ""

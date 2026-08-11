@@ -1397,7 +1397,7 @@ class HistoryWindow(QDialog):
             uploader = get_cloud_uploader()
             doctors = uploader.get_available_doctors()
             if not doctors:
-                QMessageBox.warning(self, "Error", "Could not fetch doctor list.")
+                QMessageBox.warning(self, "Error", "No Internet Connection is available. Could not fetch available doctors list.")
                 return
             pi = self.table.item(row, 3)
             current_doc = pi.text() if pi else ""
