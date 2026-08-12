@@ -390,6 +390,9 @@ class HolterFullDisclosureDialog(QDialog):
 
         self.setStyleSheet(f"QDialog {{ background: {COL_BLACK}; }}")
         self._build_ui()
+        
+        # Initialize the recording time label (total recording start-end, fixed)
+        self._update_recording_time_label()
 
         # Shared magnifier overlay (covers the whole dialog, used by TOOL_MAGNIFY)
         self._magnifier_overlay = MagnifierOverlay(self)
@@ -654,8 +657,8 @@ class HolterFullDisclosureDialog(QDialog):
         sep_undo.setStyleSheet(f"color: {COL_GREEN_DRK};")
         top_layout.addWidget(sep_undo)
 
-        # Real-time display right of time tabs
-        self.lbl_real_time = QLabel("Real Time: --:--:--")
+        # Real-time display right of time tabs (current view window)
+        self.lbl_real_time = QLabel("Frame Time: --:--:--")
         self.lbl_real_time.setStyleSheet(f"color: {COL_GREEN}; font-weight: bold; font-size: 13px;")
         top_layout.addWidget(self.lbl_real_time)
         layout.addWidget(top_bar)
@@ -839,10 +842,23 @@ class HolterFullDisclosureDialog(QDialog):
         bot_layout.addStretch()
         bot_layout.addWidget(self.lbl_arrhythmia)
         
-        self.lbl_dur = QLabel(f"Recording: {self._engine._sec_to_hms(self._engine.duration_sec)}")
-        self.lbl_dur.setStyleSheet("color: #8ab4d0; font-size: 12px;")
-        bot_layout.addWidget(self.lbl_dur)
+        # Total Recorded Time (right after arrhythmia label)
+        self.lbl_total_recorded_time = QLabel("Recording: --:--:-- - --:--:--")
+        self.lbl_total_recorded_time.setStyleSheet(f"color: {COL_GREEN}; font-weight: bold; font-size: 12px;")
+        bot_layout.addWidget(self.lbl_total_recorded_time)
         layout.addWidget(bot_bar)
+
+    def _update_recording_time_label(self):
+        """Update the total recorded time label (bottom bar, next to arrhythmia)."""
+        if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+            try:
+                start_timestamp = self._engine._reader.start_time
+                end_timestamp = start_timestamp + self._engine.duration_sec
+                start_real = datetime.fromtimestamp(start_timestamp)
+                end_real = datetime.fromtimestamp(end_timestamp)
+                self.lbl_total_recorded_time.setText(f"Recording: {start_real.strftime('%H:%M:%S')} - {end_real.strftime('%H:%M:%S')}")
+            except Exception as e:
+                print(f"[Full Disclosure] Error updating total recorded time label: {e}")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2774,7 +2790,7 @@ class HolterFullDisclosureDialog(QDialog):
         if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
             start_real = datetime.fromtimestamp(self._engine._reader.start_time + start_sec)
             end_real = datetime.fromtimestamp(self._engine._reader.start_time + end_sec)
-            self.lbl_real_time.setText(f"Real Time: {start_real.strftime('%H:%M:%S')} - {end_real.strftime('%H:%M:%S')}")
+            self.lbl_real_time.setText(f"Capture Frame Time: {start_real.strftime('%H:%M:%S')} - {end_real.strftime('%H:%M:%S')}")
         
         # Update arrhythmia indicator with MANUAL PRIORITY LOGIC
         # 1. Collect manually annotated beats (non-N) in the current window FIRST

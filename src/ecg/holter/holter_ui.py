@@ -3321,6 +3321,8 @@ class ECGStripCanvas(QWidget):
                     
                 ev_lbl = str(ev.get('label', '')).lower()
                 ev_lbl_orig = str(ev.get('label', ''))
+                source = str(ev.get('source', '')).lower()
+                is_manual_structured = source in {'manual', 'manual_parallel_multi', 'restored_parallel_multi'}
 
                 # Check if this event starts an arrhythmia
                 active_label = 'N'
@@ -3389,10 +3391,44 @@ class ECGStripCanvas(QWidget):
                     color = ev.get('color', label_colors.get(active_label, "#FF3333"))
                     # Calculate overlapping indices
                     if region_end_ts >= self._start_sec and region_start_ts <= end_sec:
-                        start_idx = max(0, int((region_start_ts - self._start_sec) * self._fs))
-                        end_idx = min(len(d) - 1, int((region_end_ts - self._start_sec) * self._fs))
-                        if start_idx < end_idx:
-                            colored_intervals.append((start_idx, end_idx, color))
+                        # Determine if this arrhythmia should color the whole region or just QRS complexes.
+                        # Asystole, Artifact, and Ventricular Fibrillation lack normal QRS and should color the whole region.
+                        # Tachycardia, Bradycardia, AFib, PVC, PAC etc. should color ONLY the QRS complexes.
+                        color_whole_region = is_manual_structured and ('ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl or 
+                                              'asystole' in ev_lbl or 'artifact' in ev_lbl or active_label == 'X')
+                        
+                        r_peak_tss = []
+                        if not color_whole_region:
+                            if hasattr(self, '_beat_annotations') and self._beat_annotations:
+                                r_peak_tss = [b.get('timestamp', 0.0) for b in self._beat_annotations]
+                            else:
+                                r_peak_tss = getattr(self, '_detected_peaks_cache', [])
+                                if not r_peak_tss:
+                                    parent = self.parent()
+                                    while parent is not None:
+                                        if hasattr(parent, '_detected_r_peaks'):
+                                            r_peak_tss = parent._detected_r_peaks
+                                            break
+                                        parent = parent.parent()
+                        
+                        # Find peaks inside this region
+                        region_peaks = [ts for ts in r_peak_tss if region_start_ts <= ts <= region_end_ts]
+                        
+                        if color_whole_region or (not region_peaks and is_manual_structured):
+                            # Color the entire region (fallback for no peaks, or explicitly requested for X / VFib)
+                            start_idx = max(0, int((region_start_ts - self._start_sec) * self._fs))
+                            end_idx = min(len(d) - 1, int((region_end_ts - self._start_sec) * self._fs))
+                            if start_idx < end_idx:
+                                colored_intervals.append((start_idx, end_idx, color))
+                        else:
+                            # Color ONLY the QRS complexes (+/- 60ms around each R-peak)
+                            for ts in region_peaks:
+                                qrs_start_ts = max(self._start_sec, ts - 0.06)
+                                qrs_end_ts = min(end_sec, ts + 0.06)
+                                start_idx = max(0, int((qrs_start_ts - self._start_sec) * self._fs))
+                                end_idx = min(len(d) - 1, int((qrs_end_ts - self._start_sec) * self._fs))
+                                if start_idx < end_idx:
+                                    colored_intervals.append((start_idx, end_idx, color))
         
 
         colored_intervals.sort(key=lambda x: x[0])
@@ -3435,112 +3471,8 @@ class ECGStripCanvas(QWidget):
             painter.drawPath(seg_path)
 
         # --- Draw Auto-Detected Arrhythmia Labels ---
-        # Display labels only for main arrhythmia types (not beat-level classifications)
-        # at the start of color-coded regions with system time
-        if not self._disable_all_coloring and hasattr(self, '_structured_events') and self._structured_events:
-            # Filter for main arrhythmia types only (exclude beat-level classifications)
-            main_arrhythmia_keywords = [
-                'sinus tachycardia', 'sinus bradycardia', 'tachycardia', 'bradycardia',
-                'atrial fibrillation', 'atrial flutter', 'afib', 'aflutter',
-                'ventricular fibrillation', 'ventricular tachycardia', 'vfib', 'vtach',
-                '1st-degree av block', '2nd-degree av block', '3rd-degree av block',
-                'right bundle branch block', 'left bundle branch block',
-                'premature ventricular contraction', 'pvc',
-                'premature atrial contraction', 'pac'
-            ]
-            
-            for ev in self._structured_events:
-                ev_ts = float(ev.get('timestamp', 0.0) or 0.0)
-                
-                # Performance fix: check visibility before string searches
-                is_visible = self._start_sec <= ev_ts <= end_sec
-                if not is_visible:
-                    continue
-                    
-                ev_label = str(ev.get('label', '')).lower()
-                ev_color = str(ev.get('color', '#FFFF00'))
-                
-                # Only draw if:
-                # 1. Event is visible in current window
-                # 2. Label contains a main arrhythmia keyword (not beat-level like "Long QT", "wide QRS", "PVC")
-                # 3. Not Normal Sinus Rhythm
-                is_main_arrhythmia = any(keyword in ev_label for keyword in main_arrhythmia_keywords)
-                is_not_nsr = 'normal sinus rhythm' not in ev_label
-                
-                if is_main_arrhythmia and is_not_nsr:
-                    # Calculate pixel position for the label
-                    label_x = int((ev_ts - self._start_sec) * self._fs * x_scale)
-                    if 0 <= label_x < w:
-                        # Get actual system recording time from recording_index.json
-                        if not hasattr(self, '_cached_start_time'):
-                            self._cached_start_time = None
-                            try:
-                                import json
-                                import os
-                                # Try to get session directory from parent
-                                session_dir = None
-                                parent = self.parent()
-                                while parent is not None:
-                                    if hasattr(parent, 'session_dir'):
-                                        session_dir = parent.session_dir
-                                        break
-                                    parent = parent.parent()
-                                
-                                if session_dir:
-                                    index_path = os.path.join(session_dir, 'recording_index.json')
-                                    if os.path.exists(index_path):
-                                        with open(index_path, 'r') as f:
-                                            index_data = json.load(f)
-                                        self._cached_start_time = index_data.get('start_time')
-                            except Exception as e:
-                                print(f"[ECGStripCanvas] Error reading system time: {e}")
-                        
-                        time_str = ""
-                        if getattr(self, '_cached_start_time', None):
-                            from datetime import datetime
-                            system_time = datetime.fromtimestamp(self._cached_start_time + ev_ts)
-                            time_str = system_time.strftime('%H:%M:%S')
-                        
-                        # Fallback to elapsed time if system time not available
-                        if not time_str:
-                            time_str = f"{int(ev_ts // 60):02d}:{int(ev_ts % 60):02d}"
-                        
-                        # Draw label background
-                        painter.setPen(QPen(QColor(ev_color)))
-                        painter.setBrush(QColor(ev_color))
-                        font = painter.font()
-                        font.setBold(True)
-                        font.setPixelSize(10)
-                        painter.setFont(font)
-                        
-                        # Calculate text dimensions
-                        label_text = str(ev.get('label', ''))
-                        label_metrics = painter.fontMetrics()
-                        label_w = label_metrics.horizontalAdvance(label_text)
-                        time_w = label_metrics.horizontalAdvance(time_str)
-                        total_w = max(label_w, time_w) + 8
-                        total_h = 28
-                        
-                        # Position label above the waveform at the exact start point
-                        label_y = 5
-                        rect_x = max(0, min(w - total_w, label_x - total_w // 2))
-                        rect_y = label_y
-                        
-                        # Draw rounded rectangle background
-                        painter.drawRoundedRect(rect_x, rect_y, total_w, total_h, 4, 4)
-                        
-                        # Draw time text (white, smaller) at top
-                        font.setPixelSize(9)
-                        font.setBold(False)
-                        painter.setFont(font)
-                        painter.setPen(QPen(QColor("#FFFFFF")))
-                        painter.drawText(rect_x + 4, rect_y + 12, time_str)
-                        
-                        # Draw label text (white, bold) below time
-                        font.setPixelSize(10)
-                        font.setBold(True)
-                        painter.setFont(font)
-                        painter.drawText(rect_x + 4, rect_y + 24, label_text)
+        # (REMOVED: Floating overlay labels have been migrated to the ArrhythmiaBadgeBar at the bottom of the window)
+
 
             
         # --- Draw Clinical Beat Annotations ---
@@ -3636,98 +3568,108 @@ class ECGStripCanvas(QWidget):
         #   2. Detected peaks that fall inside an active arrhythmia structured event (non-N)
         # Default auto-detected N labels are intentionally suppressed in Full Disclosure view.
         if self._show_annotations:
-            # Build the set of peaks to draw from annotated_beats with non-N labels only
-            peaks_to_draw = []          # list of (ts, lbl, color)
-            
-            # 1. Explicitly annotated beats
-            for annot_ts, beat in annotated_beats.items():
-                lbl = beat.get('label', 'N')
-                # Extract short code from full label name (e.g., "Normal(N)" -> "N")
-                short_code = lbl
-                if '(' in lbl and ')' in lbl:
-                    short_code = lbl.split('(')[1].split(')')[0]
+            try:
+                from ecg.holter.holter_summary_calc import get_template_beats_for_badges
                 
-                if not beat.get('is_manual', False):
-                    continue   # Only draw beat labels and timestamps for manual user annotations
-
-                color = beat.get('color', None)
-                if not color:
-                    if short_code == 'V':
-                        color = "#FF3333"
-                    elif short_code == 'S':
-                        color = "#00FFFF"
-                    elif short_code in ['AF', 'P']:
-                        color = "#FF00FF"
-                    else:
-                        color = "#FFFF00"
-                peaks_to_draw.append((annot_ts, lbl, color))
-
-            # 2. Auto-detected peaks from structured-event regions — COMMENTED OUT for now
-            # TODO: Re-enable this block when auto-arrhythmia labeling on waveforms is ready
-            # if lead_name == 'I' and show_vertical_lines and hasattr(self, '_structured_events') and self._structured_events:
-            #     for dt in detected_peaks:
-            #         # Skip if an explicit annotation already covers this peak
-            #         if any(abs(dt - at) < 0.20 for at in annotated_beats.keys()):
-            #             continue
-            #         # Determine if this peak lies in an active arrhythmia event region
-            #         active_label = 'N'
-            #         recent_ev = None
-            #         for ev in self._structured_events:
-            #             ev_ts = float(ev.get('timestamp', 0.0) or 0.0)
-            #             if ev_ts <= dt + 0.2:
-            #                 recent_ev = ev
-            #             else:
-            #                 break
-            #         if recent_ev:
-            #             ev_lbl = str(recent_ev.get('label', '')).lower()
-            #             if 'ventricular fibrillation' in ev_lbl or 'vfib' in ev_lbl or 'ventricular tachycardia' in ev_lbl or 'vtach' in ev_lbl:
-            #                 active_label = 'V'
-            #             elif 'atrial fibrillation' in ev_lbl or 'afib' in ev_lbl:
-            #                 active_label = 'AF'
-            #         if active_label != 'N':
-            #             if active_label == 'V':
-            #                 c = "#FF3333"
-            #             elif active_label == 'AF':
-            #                 c = "#FF00FF"
-            #             else:
-            #                 c = "#FFFF00"
-            #             peaks_to_draw.append((dt, active_label, c))
-
-            if peaks_to_draw:
-                # Resolve recording start time once per paint cycle
-                start_time = self._get_reader_start_time()
+                # Use beat annotations (which includes all beats in window) and structured events
+                window_beats = getattr(self, '_beat_annotations', [])
+                window_events = getattr(self, '_structured_events', [])
+                badges = get_template_beats_for_badges(window_beats, window_events)
                 
-                from datetime import datetime
+                # Add explicitly manual annotations if not already there
+                manual_badges = []
+                for annot_ts, beat in annotated_beats.items():
+                    if beat.get('is_manual', False) and beat.get('label', 'N') != 'N':
+                        lbl = beat.get('label', 'N')
+                        short_code = lbl
+                        if '(' in lbl and ')' in lbl:
+                            short_code = lbl.split('(')[1].split(')')[0]
+                        # Only add if not already in badges at similar timestamp
+                        if not any(abs(b['timestamp'] - annot_ts) < 0.1 for b in badges):
+                            color = beat.get('color', '#FFFF00')
+                            if not color or color == '#FFFF00': # fallback
+                                 if short_code == 'V': color = "#FF3333"
+                                 elif short_code == 'S': color = "#00FFFF"
+                                 elif short_code in ['AF', 'P']: color = "#FF00FF"
+                            manual_badges.append({
+                                'timestamp': annot_ts,
+                                'code': short_code,
+                                'name': lbl,
+                                'color': color
+                            })
                 
-                for ts, lbl, color in peaks_to_draw:
-                    pct = (ts - self._start_sec) / (end_sec - self._start_sec) if (end_sec - self._start_sec) > 0 else 0.0
-                    bx = int(pct * w)
-
-                    # --- Draw time string above the label (white, bold) ---
-                    if start_time:
-                        beat_time_str = datetime.fromtimestamp(start_time + ts).strftime('%H:%M:%S')
-                        time_font = painter.font()
-                        time_font.setPixelSize(9)
-                        time_font.setBold(True)
-                        painter.setFont(time_font)
-                        painter.setPen(QPen(QColor("#FFFFFF")))
-                        time_width = painter.fontMetrics().horizontalAdvance(beat_time_str)
-                        painter.drawText(bx - (time_width // 2), 12, beat_time_str)
-
-                    # --- Draw beat label (bold, larger font) below the time ---
-                    lbl_font = painter.font()
-                    lbl_font.setPixelSize(11)
-                    lbl_font.setBold(True)
-                    painter.setFont(lbl_font)
-                    painter.setPen(QPen(QColor(color)))
-                    lbl_width = painter.fontMetrics().horizontalAdvance(lbl)
-                    painter.drawText(bx - (lbl_width // 2), 24, lbl)
+                all_badges = badges + manual_badges
+                
+                if all_badges:
+                    start_time = self._get_reader_start_time()
+                    from datetime import datetime
                     
-                    # Restore a clean font state for subsequent peaks
-                    restore_font = painter.font()
-                    restore_font.setBold(False)
-                    restore_font.setPixelSize(10)
-                    painter.setFont(restore_font)
+                    for badge in all_badges:
+                        ts = badge['timestamp']
+                        if not (self._start_sec <= ts <= end_sec):
+                            continue
+                        
+                        pct = (ts - self._start_sec) / (end_sec - self._start_sec) if (end_sec - self._start_sec) > 0 else 0.0
+                        bx = int(pct * w)
+                        
+                        color = badge['color']
+                        code_str = f"[{badge['code']}]"
+                        name_str = badge['name']
+                        time_str = datetime.fromtimestamp(start_time + ts).strftime('%H:%M:%S') if start_time else ""
+                        
+                        # Set up fonts
+                        restore_font = painter.font()
+                        font = painter.font()
+                        font.setPixelSize(10)
+                        font.setBold(True)
+                        painter.setFont(font)
+                        
+                        fm = painter.fontMetrics()
+                        code_w = fm.horizontalAdvance(code_str)
+                        name_w = fm.horizontalAdvance(name_str)
+                        
+                        font.setBold(False)
+                        painter.setFont(font)
+                        fm_time = painter.fontMetrics()
+                        time_w = fm_time.horizontalAdvance(time_str)
+                        
+                        padding = 4
+                        spacing = 4
+                        total_w = code_w + name_w + time_w + (spacing * 2) + (padding * 2)
+                        total_h = fm.height() + padding * 2
+                        
+                        # Position badge slightly above the trace
+                        rect_x = bx - total_w // 2
+                        rect_y = 5
+                        
+                        # Draw pill background (transparent dark with cyan border)
+                        painter.setPen(QPen(QColor(color), 1))
+                        painter.setBrush(QColor(20, 20, 20, 200)) # Dark transparent
+                        painter.drawRoundedRect(rect_x, rect_y, total_w, total_h, 4, 4)
+                        
+                        # Draw code (cyan, bold)
+                        font.setBold(True)
+                        painter.setFont(font)
+                        curr_x = rect_x + padding
+                        painter.setPen(QPen(QColor(color)))
+                        painter.drawText(curr_x, rect_y + fm.ascent() + padding, code_str)
+                        curr_x += code_w + spacing
+                        
+                        # Draw name (white, bold)
+                        painter.setPen(QPen(QColor("#FFFFFF")))
+                        painter.drawText(curr_x, rect_y + fm.ascent() + padding, name_str)
+                        curr_x += name_w + spacing
+                        
+                        # Draw time (light blue, normal)
+                        font.setBold(False)
+                        painter.setFont(font)
+                        painter.setPen(QPen(QColor("#A0C4E8")))
+                        painter.drawText(curr_x, rect_y + fm.ascent() + padding, time_str)
+                        
+                        # Restore font
+                        painter.setFont(restore_font)
+            except Exception as e:
+                print(f"[ECGStripCanvas] Error drawing beat badges: {e}")
 
         
         # --- Draw square boxes for selected beats (only on Lead I) ---
@@ -7235,8 +7177,9 @@ class HistogramCanvas(QWidget):
 # -----------------------------------------------------------------------------
 
 class HolterAFPanel(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, session_dir: str = ""):
         super().__init__(parent)
+        self.session_dir = session_dir
         self.setStyleSheet(f"background:{COL_BG};")
         self._build_ui()
 
@@ -7333,10 +7276,36 @@ class HolterAFPanel(QWidget):
         af_events = [(m['t'], m.get('arrhythmias', [])) for m in metrics_list
                      if any('AF' in a or 'Fibrill' in a for a in m.get('arrhythmias', []))]
         self._af_table.setRowCount(len(af_events))
+        
+        # Get the actual recording start time from session
+        recording_start_timestamp = None
+        if self.session_dir:
+            try:
+                ecgh_path = os.path.join(self.session_dir, 'recording.ecgh')
+                if os.path.exists(ecgh_path):
+                    # Get file modification time as the recording start time
+                    recording_start_timestamp = os.path.getmtime(ecgh_path) - duration_sec
+                else:
+                    # Fallback: use current time minus duration
+                    import time
+                    recording_start_timestamp = time.time() - duration_sec
+            except Exception as e:
+                print(f"[HolterAFPanel] Error getting recording start time: {e}")
+                import time
+                recording_start_timestamp = time.time() - duration_sec
+        
         if af_events:
             self._no_items_lbl.hide()
             for i, (t, arrhy) in enumerate(af_events):
-                for j, val in enumerate([_sec_to_hms(t), "30s", "AF/Af"]):
+                # Calculate actual system time if we have the recording start time
+                if recording_start_timestamp:
+                    from datetime import datetime
+                    event_timestamp = recording_start_timestamp + t
+                    actual_time_str = datetime.fromtimestamp(event_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    actual_time_str = _sec_to_hms(t)
+                
+                for j, val in enumerate([actual_time_str, "30s", "AF/Af"]):
                     item = QTableWidgetItem(val)
                     item.setForeground(QColor(COL_WHITE))
                     self._af_table.setItem(i, j, item)
@@ -10259,7 +10228,7 @@ class HolterMainWindow(QDialog):
 
 
         # AF Analysis
-        self._af_panel = HolterAFPanel()
+        self._af_panel = HolterAFPanel(session_dir=self.session_dir)
         self._af_panel.update_from_metrics(self._metrics_list, duration)
         self._tabs.addTab(self._af_panel, "AF ANALYSIS")
 
