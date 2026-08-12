@@ -832,7 +832,7 @@ class PublicReportsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Select Report")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setMinimumWidth(900)
+        self.setMinimumSize(900, 560)
         self._all = [r for r in (reports or []) if isinstance(r, dict)]
         self._selected = None
 
@@ -843,7 +843,7 @@ class PublicReportsDialog(QDialog):
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Search Name:"))
         self.name_search = QLineEdit()
-        self.name_search.setPlaceholderText("Type patient name…")
+        self.name_search.setPlaceholderText("Type patient name...")
         filters.addWidget(self.name_search, 2)
 
         filters.addWidget(QLabel("Search Date:"))
@@ -855,82 +855,6 @@ class PublicReportsDialog(QDialog):
         self.date_search.setSpecialValueText("Any")
         self.date_search.setDate(self._date_any)
         self.date_search.setFixedWidth(150)
-        self.date_search.setStyleSheet(
-            "QDateEdit{"
-            " background:#0f1220;"
-            " color:#fff4e8;"
-            " border:1px solid #5e4827;"
-            " border-radius:8px;"
-            " padding:6px 34px 6px 10px;"
-            " font-size:12px;"
-            " font-family:'Segoe UI', Arial;"
-            "}"
-            "QDateEdit:hover{border-color:#ff8a1f;}"
-            "QDateEdit:focus{border-color:#ff8a1f;}"
-            "QDateEdit::drop-down{"
-            " subcontrol-origin:padding;"
-            " subcontrol-position:top right;"
-            " width:28px;"
-            " border-left:1px solid #5e4827;"
-            " background:#15192b;"
-            " border-top-right-radius:8px;"
-            " border-bottom-right-radius:8px;"
-            "}"
-            "QDateEdit::drop-down:hover{background:#1b2036;}"
-        )
-        try:
-            cal = self.date_search.calendarWidget()
-            cal.setGridVisible(True)
-            cal.setStyleSheet(
-                "QCalendarWidget{"
-                " background:#0f1220;"
-                " color:#fff4e8;"
-                " border:1px solid #5e4827;"
-                " border-radius:10px;"
-                "}"
-                "QCalendarWidget QWidget#qt_calendar_navigationbar{"
-                " background:#15192b;"
-                " border-top-left-radius:10px;"
-                " border-top-right-radius:10px;"
-                "}"
-                "QCalendarWidget QToolButton{"
-                " color:#fff4e8;"
-                " background:transparent;"
-                " border:none;"
-                " font-weight:bold;"
-                " padding:6px 10px;"
-                " margin:4px;"
-                " border-radius:8px;"
-                "}"
-                "QCalendarWidget QToolButton:hover{background:#1b2036;}"
-                "QCalendarWidget QToolButton:pressed{background:#241808;}"
-                "QCalendarWidget QSpinBox{"
-                " background:#0f1220;"
-                " color:#fff4e8;"
-                " border:1px solid #5e4827;"
-                " border-radius:6px;"
-                " padding:2px 6px;"
-                " margin:4px;"
-                "}"
-                "QCalendarWidget QSpinBox::up-button, QCalendarWidget QSpinBox::down-button{width:18px;}"
-                "QCalendarWidget QAbstractItemView{"
-                " background:#0b0f1d;"
-                " color:#fff4e8;"
-                " selection-background-color:#ff8a1f;"
-                " selection-color:#ffffff;"
-                " gridline-color:#2a2230;"
-                " outline:0;"
-                "}"
-                "QCalendarWidget QAbstractItemView:disabled{color:#6b5a4a;}"
-                "QCalendarWidget QMenu{"
-                " background:#15192b;"
-                " color:#fff4e8;"
-                " border:1px solid #5e4827;"
-                "}"
-                "QCalendarWidget QMenu::item:selected{background:#1b2036;}"
-            )
-        except Exception:
-            pass
         filters.addWidget(self.date_search, 0)
 
         self.clear_filters_btn = QPushButton("Clear")
@@ -991,69 +915,45 @@ class PublicReportsDialog(QDialog):
         if query and query not in name.lower():
             return False
 
-        # Date filter (match by YYYY-MM-DD)
         try:
             chosen = self.date_search.date()
             if chosen != self._date_any:
                 rdate = self._norm(self._get_first(report, "report_date", "reportDate", "date", "created_at", "createdAt"))
-                iso = (rdate.replace("Z", "").replace("z", "") or "").strip()
-                date_part = ""
-                if "T" in iso:
-                    date_part = iso.split("T", 1)[0]
-                elif " " in iso:
-                    date_part = iso.split(" ", 1)[0]
-                else:
-                    date_part = iso[:10]
-                # Compare to chosen date in ISO format
-                if date_part and date_part != chosen.toString("yyyy-MM-dd"):
+                if not rdate:
+                    return False
+                dt = None
+                for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%d/%m/%Y"):
+                    try:
+                        dt = datetime.strptime(rdate[:19], fmt)
+                        break
+                    except Exception:
+                        pass
+                if dt is None:
+                    return False
+                if dt.date() != chosen.toPyDate():
                     return False
         except Exception:
-            # If date parsing fails, don't filter out by date
             pass
-
         return True
 
     def _refresh_table(self):
-        self.table.setUpdatesEnabled(False)
-        self.table.blockSignals(True)
-        try:
-            rows = [r for r in self._all if self._matches(r)]
-            self.table.clearContents()
-            self.table.setRowCount(len(rows))
-
-            for row, report in enumerate(rows):
-                name = self._norm(self._get_first(report, "name", "patient_name", "patientName")) or "Unknown"
-                age_val = self._get_first(report, "age", "patient_age", "patientAge")
-                gender_val = self._get_first(report, "gender", "patient_gender", "patientGender")
-
-                age_str = self._norm(age_val)
-                gender_str = self._norm(gender_val)
-
-                if age_str and gender_str:
-                    ag_str = f"{age_str}/{gender_str}"
-                elif age_str:
-                    ag_str = age_str
-                elif gender_str:
-                    ag_str = gender_str
-                else:
-                    ag_str = "—"
-
-                vals = [name, ag_str]
-                for col, val in enumerate(vals):
-                    item = QTableWidgetItem(val)
-                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter if col == 0 else Qt.AlignCenter)
-                    self.table.setItem(row, col, item)
-                if self.table.item(row, 0):
-                    self.table.item(row, 0).setData(Qt.UserRole, report)
-                self.table.setRowHeight(row, 28)
-        finally:
-            self.table.blockSignals(False)
-            self.table.setUpdatesEnabled(True)
+        rows = [r for r in self._all if self._matches(r)]
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            name = self._norm(self._get_first(r, "name", "patient_name", "patientName")) or "Unnamed"
+            age = self._norm(self._get_first(r, "age", "patient_age", "patientAge")) or "-"
+            gender = self._norm(self._get_first(r, "gender", "patient_gender", "patientGender")) or "-"
+            item0 = QTableWidgetItem(name)
+            item1 = QTableWidgetItem(f"{age}/{gender}")
+            item0.setData(Qt.UserRole, r)
+            item1.setData(Qt.UserRole, r)
+            self.table.setItem(i, 0, item0)
+            self.table.setItem(i, 1, item1)
+        self.table.resizeRowsToContents()
 
     def _accept_selected(self):
         row = self.table.currentRow()
         if row < 0:
-            QMessageBox.information(self, "Select", "Select a report first.")
             return
         item = self.table.item(row, 0)
         self._selected = item.data(Qt.UserRole) if item else None
@@ -1061,8 +961,6 @@ class PublicReportsDialog(QDialog):
 
     def get_selected_report(self):
         return self._selected
-
-
 class ECGAnalysisWindow(QDialog):
     """Professional ECG Analysis Window with clinical-grade doctor tools."""
 
@@ -2051,9 +1949,9 @@ class ECGAnalysisWindow(QDialog):
         self.findings_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         right_col.addWidget(self.findings_text)
 
-        # Hide per original user instruction (kept for PDF gen logic)
+                # Keep the metrics/finding panel visible so interval values show on screen.
         for w in (metrics_lbl, self.metrics_table, findings_lbl, self.findings_text):
-            w.setVisible(False)
+            w.setVisible(True)
 
         h.addLayout(right_col, stretch=1)
         return frame

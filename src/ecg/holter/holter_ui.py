@@ -5966,7 +5966,7 @@ class HolterRecordManagementPanel(QWidget):
         actions.addWidget(QLabel("Filter:", styleSheet=f"color:{COL_GREEN};font-size:12px;"))
         actions.addWidget(self._filter)
         self._action_buttons = {}
-        for txt in ["Browse", "Import", "Export", "Backup", "Delete"]:
+        for txt in ["Browse", "Import System Report", "Import App Report", "Export", "Backup", "Delete"]:
             btn = QPushButton(txt)
             btn.setStyleSheet(_style_btn())
             self._action_buttons[txt] = btn
@@ -6000,7 +6000,8 @@ class HolterRecordManagementPanel(QWidget):
         self._table.doubleClicked.connect(self._on_double_click)
         layout.addWidget(self._table, 1)
         self._action_buttons["Browse"].clicked.connect(self._browse_root)
-        self._action_buttons["Import"].clicked.connect(self._import_session)
+        self._action_buttons["Import System Report"].clicked.connect(self._import_session)
+        self._action_buttons["Import App Report"].clicked.connect(lambda: self.window()._import_app_recording())
         self._action_buttons["Export"].clicked.connect(self._export_session)
         self._action_buttons["Backup"].clicked.connect(self._backup_root)
         self._action_buttons["Delete"].clicked.connect(self._delete_session)
@@ -6089,7 +6090,7 @@ class HolterRecordManagementPanel(QWidget):
             except Exception:
                 pass
 
-            row_values = [p_name, age, gender, rec_time, dur_str, "12", rec_time, "Completed", "System", "-"]
+            row_values = [p_name, age, gender, rec_time, dur_str, "12", rec_time, "Completed", str((locals().get("sdata", {}) or {}).get("reporter") or (locals().get("sdata", {}) or {}).get("source") or "System"), "-"]
             if query and not any(query in str(v).lower() for v in row_values): continue
             rows.append((row_values, session_dir))
 
@@ -9741,6 +9742,309 @@ class HolterMainWindow(QDialog):
         if panel and hasattr(panel, '_import_session'):
             panel._import_session()
 
+    def _import_app_recording(self):
+        if self._is_replay_active():
+            return
+
+        mobile_no = self._prompt_mobile_number()
+        if not mobile_no:
+            return
+
+        try:
+            from ecg.holter.app_report_import import (
+                build_app_session_from_report,
+                fetch_public_reports,
+                normalize_mobile_no,
+            )
+        except Exception as exc:
+            _show_message_box(
+                self,
+                QMessageBox.Critical,
+                "Import App Report",
+                f"Unable to load the app report helper: {exc}",
+            )
+            return
+
+        mobile_digits = normalize_mobile_no(mobile_no)
+        if len(mobile_digits) != 10:
+            _show_message_box(
+                self,
+                QMessageBox.Warning,
+                "Import App Report",
+                "Enter a valid 10-digit mobile number.",
+            )
+            return
+
+        from PyQt5.QtWidgets import QProgressDialog
+
+        fetch_progress = QProgressDialog(f"Fetching reports for {mobile_digits}...", None, 0, 0, self)
+        fetch_progress.setWindowTitle("Import App Report")
+        fetch_progress.setWindowModality(Qt.WindowModal)
+        fetch_progress.setCancelButton(None)
+        fetch_progress.setMinimumDuration(0)
+        fetch_progress.setStyleSheet(f"QProgressDialog{{background:{COL_DARK};color:{COL_GREEN};}}")
+        fetch_progress.show()
+        QApplication.processEvents()
+
+        try:
+            reports = fetch_public_reports(mobile_digits)
+        except Exception as exc:
+            fetch_progress.close()
+            _show_message_box(
+                self,
+                QMessageBox.Critical,
+                "Import App Report",
+                f"Failed to fetch reports for {mobile_digits}: {exc}",
+            )
+            return
+
+        fetch_progress.close()
+
+        if not isinstance(reports, list) or not reports:
+            _show_message_box(
+                self,
+                QMessageBox.Information,
+                "Import App Report",
+                f"No reports found for {mobile_digits}.",
+            )
+            return
+
+        try:
+            from dashboard.analysis_window import PublicReportsDialog
+        except Exception as exc:
+            _show_message_box(
+                self,
+                QMessageBox.Critical,
+                "Import App Report",
+                f"Unable to open the report picker: {exc}",
+            )
+            return
+
+        dlg = PublicReportsDialog(reports, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        selected = dlg.get_selected_report()
+        if not selected:
+            return
+
+        panel = self._recordings_panel()
+        output_dir = getattr(panel, "output_dir", "") or _resolve_recordings_dir(self.session_dir)
+
+        def _has_waveform_payload(report_obj: dict) -> bool:
+            if not isinstance(report_obj, dict):
+                return False
+
+            ecg_data = report_obj.get("ecg_data") if isinstance(report_obj.get("ecg_data"), dict) else {}
+            for source in (ecg_data, report_obj):
+                if not isinstance(source, dict):
+                    continue
+                if isinstance(source.get("leads"), dict):
+                    return True
+                if isinstance(source.get("leads_data"), dict):
+                    return True
+                if isinstance(source.get("device_data"), dict):
+                    return True
+                if isinstance(source.get("device_data"), str) and "|" in source.get("device_data"):
+                    return True
+                for key in (
+                    "lead1_reading", "lead_1_reading", "lead1", "lead_i",
+                    "lead2_reading", "lead_2_reading", "lead2", "lead_ii",
+                    "lead3_reading", "lead_3_reading", "lead3", "lead_iii",
+                    "leadavr_reading", "lead_avr_reading", "avr",
+                    "leadavl_reading", "lead_avl_reading", "avl",
+                    "leadavf_reading", "lead_vf_reading", "avf",
+                    "leadv1_reading", "lead_v1_reading", "v1",
+                    "leadv2_reading", "lead_v2_reading", "v2",
+                    "leadv3_reading", "lead_v3_reading", "v3",
+                    "leadv4_reading", "lead_v4_reading", "v4",
+                    "leadv5_reading", "lead_v5_reading", "v5",
+                    "leadv6_reading", "lead_v6_reading", "v6",
+                ):
+                    val = source.get(key)
+                    if isinstance(val, list) and len(val) > 10:
+                        return True
+                    if isinstance(val, str) and val.strip():
+                        return True
+            return False
+
+        def _fetch_public_report_detail_by_report_id(report_id: str, mobile_no: str = None):
+            """Best-effort fetch for a single report by report_id when the list item is metadata-only."""
+            rid = str(report_id or "").strip()
+            if not rid:
+                return None
+
+            base = "https://pmltkfluqk.execute-api.us-east-1.amazonaws.com/dev/api/public"
+            candidates = []
+            mn = normalize_mobile_no(mobile_no) if mobile_no else ""
+            if len(mn) == 10:
+                candidates.append(f"{base}/reports?mobile_no={mn}&report_id={rid}")
+                candidates.append(f"{base}/reports?mobile_no={mn}&reportId={rid}")
+
+            candidates += [
+                f"{base}/report?report_id={rid}",
+                f"{base}/report?reportId={rid}",
+                f"{base}/reports?report_id={rid}",
+                f"{base}/reports?reportId={rid}",
+                f"{base}/reports?id={rid}",
+            ]
+
+            import requests
+            sess = requests.Session()
+            for url in candidates:
+                try:
+                    resp = sess.get(url, timeout=15)
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        if payload.get("status") is False:
+                            continue
+                        data = payload.get("data") or payload.get("report") or payload.get("item")
+                        if isinstance(data, dict):
+                            return data
+                        if isinstance(data, list) and data:
+                            first = data[0]
+                            return first if isinstance(first, dict) else None
+                        if any(k in payload for k in ("ecg_data", "leads", "device_data", "lead1_reading")):
+                            return payload
+                    if isinstance(payload, list) and payload:
+                        first = payload[0]
+                        return first if isinstance(first, dict) else None
+                except Exception:
+                    continue
+            return None
+
+        build_progress = QProgressDialog("Importing selected report...", None, 0, 0, self)
+        build_progress.setWindowTitle("Import App Report")
+        build_progress.setWindowModality(Qt.WindowModal)
+        build_progress.setCancelButton(None)
+        build_progress.setMinimumDuration(0)
+        build_progress.setStyleSheet(f"QProgressDialog{{background:{COL_DARK};color:{COL_GREEN};}}")
+        build_progress.show()
+        QApplication.processEvents()
+
+        try:
+            session_input = selected
+            if not _has_waveform_payload(session_input):
+                rep_id = (
+                    session_input.get("report_id")
+                    or session_input.get("reportId")
+                    or session_input.get("id")
+                    or session_input.get("reportID")
+                    or ""
+                )
+                detail = _fetch_public_report_detail_by_report_id(rep_id, mobile_no=mobile_digits)
+                if isinstance(detail, dict) and _has_waveform_payload(detail):
+                    session_input = detail
+
+            session_dir, patient_info = build_app_session_from_report(session_input, mobile_digits, output_dir)
+        except Exception as exc:
+            build_progress.close()
+            _show_message_box(
+                self,
+                QMessageBox.Critical,
+                "Import App Report",
+                f"Unable to import the selected report: {exc}",
+            )
+            return
+
+        build_progress.close()
+
+        if panel is not None and hasattr(panel, "refresh_records"):
+            panel.refresh_records()
+
+        try:
+            self.load_completed_session(session_dir, patient_info)
+        except Exception as exc:
+            _show_message_box(
+                self,
+                QMessageBox.Warning,
+                "Import App Report",
+                f"The report was imported, but could not be opened automatically: {exc}",
+            )
+
+    def _prompt_mobile_number(self) -> str:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import App Report")
+        dlg.setFixedSize(380, 165)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dlg.setStyleSheet(f"""
+            QDialog {{
+                background: {UI_BG};
+                border: 1px solid {UI_BORDER};
+                border-radius: 10px;
+            }}
+            QLabel {{
+                color: {UI_TEXT};
+                background: transparent;
+                border: none;
+                font-size: 12px;
+            }}
+            QLineEdit {{
+                background: {COL_DARK};
+                color: {UI_TEXT};
+                border: 1px solid {COL_GREEN_DRK};
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 13px;
+                selection-background-color: {UI_ACCENT};
+                selection-color: {UI_TEXT};
+            }}
+            QLineEdit:focus {{
+                border-color: {COL_GREEN};
+            }}
+            QPushButton {{
+                background: {UI_PANEL_ALT};
+                color: {UI_TEXT};
+                border: 1px solid {UI_BORDER};
+                border-radius: 6px;
+                padding: 7px 18px;
+                min-width: 78px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background: #1A2C49;
+            }}
+            QPushButton:pressed {{
+                background: {UI_BORDER};
+            }}
+        """)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("Enter mobile number")
+        title.setStyleSheet(f"color:{UI_TEXT};font-size:14px;font-weight:700;border:none;")
+        layout.addWidget(title)
+
+        subtitle = QLabel("Type the 10-digit mobile number linked to the APP report.")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(f"color:{UI_MUTED};font-size:11px;border:none;")
+        layout.addWidget(subtitle)
+
+        edit = QLineEdit()
+        edit.setPlaceholderText("e.g. XXXXXXXXXX")
+        edit.setClearButtonEnabled(True)
+        layout.addWidget(edit)
+        edit.setFocus()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        ok_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+        edit.returnPressed.connect(dlg.accept)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return ""
+        return edit.text().strip()
+
     def _backup_recordings(self):
         if self._is_replay_active():
             return
@@ -9763,7 +10067,7 @@ class HolterMainWindow(QDialog):
     def _set_record_browser_enabled(self, enabled: bool):
         panel = self._recordings_panel()
         if panel is not None:
-            for name in ("Browse", "Import", "Export", "Backup", "Delete"):
+            for name in ("Browse", "Import System Report", "Import App Report", "Export", "Backup", "Delete"):
                 btn = getattr(panel, "_action_buttons", {}).get(name)
                 if btn is not None:
                     btn.setEnabled(bool(enabled))
@@ -10074,7 +10378,7 @@ class HolterMainWindow(QDialog):
         ab_layout.setContentsMargins(8, 6, 8, 6)
         ab_layout.setSpacing(6)
         self._action_buttons = {}
-        for label in ["Browse", "Search", "Analyse", "View", "Import", "Backup", "Delete"]:
+        for label in ["Browse", "Search", "Analyse", "View", "Import System Report", "Import App Report", "Backup", "Delete"]:
             btn = QPushButton(label)
             btn.setFixedHeight(30)
             btn.setStyleSheet(_style_btn())
@@ -10332,7 +10636,8 @@ class HolterMainWindow(QDialog):
         self._action_buttons["Search"].clicked.connect(self._search_recordings)
         self._action_buttons["Analyse"].clicked.connect(lambda: self._focus_tab("REPLAY"))
         self._action_buttons["View"].clicked.connect(lambda: self._focus_tab("PREVIEW"))
-        self._action_buttons["Import"].clicked.connect(self._import_recording)
+        self._action_buttons["Import System Report"].clicked.connect(self._import_recording)
+        self._action_buttons["Import App Report"].clicked.connect(self._import_app_recording)
         self._action_buttons["Backup"].clicked.connect(self._backup_recordings)
         self._action_buttons["Delete"].clicked.connect(self._delete_recording)
         for label, btn in self._filter_buttons.items():
