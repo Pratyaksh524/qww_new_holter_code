@@ -1,4 +1,16 @@
 import os
+
+
+def _dev_autologin_enabled() -> bool:
+    """
+    True only when the developer auto-login bypass is explicitly switched on.
+
+    The bypass skips the password prompt AND the licence gate (heartbeat,
+    revocation, offline grace), so it defaults to OFF and is never enabled in a
+    distributed build — CARDIOX_DEV_AUTOLOGIN is stripped from the installer's
+    .env by build_exe.py.
+    """
+    return os.getenv("CARDIOX_DEV_AUTOLOGIN", "").strip().lower() in ("1", "true", "yes", "on")
 from utils.app_paths import data_file
 import json
 import base64
@@ -358,20 +370,23 @@ class LoginRegisterDialog(QDialog):
         self.user_details = {}
 
     def exec_(self):
-        # Auto-login bypass with username 'cardiomac' / phone '9560350477'
-        try:
-            print("🔑 Bypassing login screen for user: cardiomac (9560350477)")
-            found = self.sign_in_logic._find_user_record("cardiomac")
-            if found:
-                username, record = found
-                self.result = True
-                self.username = username
-                self.user_details = record
-                return QDialog.Accepted
-            else:
-                print("⚠️ User 'cardiomac' not found in users.json! Showing login dialog...")
-        except Exception as e:
-            print(f"⚠️ Bypass login error: {e}")
+        # Development-only auto-login for the 'cardiomac' test account.
+        # Returns QDialog.Accepted with no password check and no licence
+        # verification, so it is gated OFF by default. See _dev_autologin_enabled().
+        if _dev_autologin_enabled():
+            try:
+                print("🔑 [DEV] Bypassing login screen for user: cardiomac (9560350477)")
+                found = self.sign_in_logic._find_user_record("cardiomac")
+                if found:
+                    username, record = found
+                    self.result = True
+                    self.username = username
+                    self.user_details = record
+                    return QDialog.Accepted
+                else:
+                    print("⚠️ User 'cardiomac' not found in users.json! Showing login dialog...")
+            except Exception as e:
+                print(f"⚠️ Bypass login error: {e}")
         return super().exec_()
 
     def init_ui(self):

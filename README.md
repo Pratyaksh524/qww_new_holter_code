@@ -102,6 +102,91 @@ python -m pytest tests/test_cardiox_prod.py -v
 
 ---
 
+## 🔐 Licensing & Device Authorization
+
+The licensing rules below are the product specification. Treat them as authoritative
+when changing `src/utils/license_manager.py`, the login flow in `src/main.py`, or the
+`cardiox-license-*` Lambdas.
+
+### Business rules
+
+| # | Rule |
+|---|---|
+| 1 | **Signup** creates the account server-side and shows the user their credentials once. |
+| 2 | **One RhythmUltra device allows 5 signups** — five *different* machines may share one device serial (e.g. `DM ECG V1.0 A010`). |
+| 3 | **Revocation stops the software.** Login is blocked, the user is told the licence is revoked and to contact Deckmount support, every local credential is wiped, and they are returned to Sign Up. |
+| 4 | **A revoked user may not sign up again.** The server must refuse re-registration. Otherwise revocation is meaningless — the customer is running again in under a minute. |
+| 5 | **Releasing a seat is a separate admin action** that re-opens registration. Only after a seat is explicitly freed may that user register again. |
+| 6 | **Offline grace is 7 days.** A periodic server heartbeat is mandatory — it is what prevents a one-time signup being used indefinitely on a machine that never contacts the server again. |
+| 7 | **The final 3 days of the offline window show a warning** on every launch: internet is required for verification or the software will stop. |
+| 8 | **Exhausting offline grace must never wipe credentials.** Unlike revocation, the user simply needs to get back online. Local `users.json` records are never deleted — that is shared clinical data. |
+
+Revocation is detected **only** by the Check-5 heartbeat inside `run_startup_checks()`.
+Never make that call conditional on local state such as a token file existing; doing so
+silently disables revocation enforcement entirely.
+
+### Enforced in the client
+
+| Behaviour | Where |
+|---|---|
+| Revoked seat blocks login, wipes credentials, returns to Sign Up | `src/main.py` |
+| Licence gate **fails closed** — an error in the gate denies access rather than falling through to login | `src/main.py` |
+| Developer auto-login gated behind `CARDIOX_DEV_AUTOLOGIN` (default off) | `src/main.py`, `src/auth/sign_in.py` |
+| 7-day offline grace with a 3-day countdown warning | `src/utils/license_manager.py` |
+| Signup failures show a specific dialog — device limit, revoked, or server unreachable | `src/utils/license_dialog.py` |
+| Server-side secrets stripped from the distributed `.env`; build aborts on an unvetted secret | `build_exe.py` |
+
+Both revocation codes the server emits (`LICENSE_REVOKED` for a revoked licence,
+`ACCOUNT_REVOKED` for a revoked seat) map to the same user-facing message, so the wording
+does not depend on which one arrived.
+
+### Enforced in the database
+
+Applied by `license_server/migrations/001_seat_integrity.sql`:
+
+- unique index on `(license_id, bound_fingerprint)` — one live seat per machine per licence
+- unique index on `(license_id, seat_number)`
+- `CHECK` constraint restricting `plan_type` to `single` / `clinic` / `hospital` / `enterprise`
+- `trg_supersede_duplicate_seat` — **temporary**, substituting for the fingerprint dedup the register Lambda is missing
+
+**Releasing a seat requires two statements.** Updating `license_seats` alone leaves the
+licence at `status='active'` with no seats, and the register path only draws licences
+whose status is `'unused'`, so the key is stranded permanently:
+
+```sql
+UPDATE license_seats
+   SET status='revoked', revoked_at=NOW(), released_at=NOW()
+ WHERE rhythmulta_serial = :serial AND status='active';
+
+UPDATE licenses l SET status='unused'
+ WHERE l.id = :license_id
+   AND NOT EXISTS (SELECT 1 FROM license_seats s
+                    WHERE s.license_id = l.id AND s.status='active');
+```
+
+Seat status values: `active` (live), `revoked` (admin block), `superseded` (retired by
+the dedup trigger when the same machine re-registered — not a licensing decision).
+
+### Known gaps
+
+Not yet implemented in `cardiox-license-register`:
+
+- **Rule 4 is not enforced** — a revoked user can still sign up again. Needs a refusal when
+  a seat exists for the fingerprint with `status='revoked' AND released_at IS NULL`.
+- `license_key` in the request body is ignored entirely; a key absent from the database
+  returns the same response as a valid one.
+- No hardware fingerprint dedup, which is why the database trigger exists.
+- `seat_number` is derived as `COUNT(*)+1` rather than `MAX(seat_number)+1`, so it
+  collides after any row deletion.
+- Resolve → check → insert is not wrapped in a transaction, so two concurrent signups can
+  both pass the seat-cap check.
+
+Client-side, tokens are signed by the server with `JWT_SECRET` but verified against
+`LICENSE_HMAC_SECRET`, so offline signature verification cannot succeed. Real offline
+tamper detection requires moving to RS256 and shipping only the public key.
+
+---
+
 ## 📋 Changelog
 
 ### 🔧 [2026-08-03] — Security, Report Formatting, 12-Lead Freeze/Resume & Dashboard Fixes
