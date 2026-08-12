@@ -783,18 +783,46 @@ class RegistrationDialog(QDialog):
         else:
             msg = result.get("message") or result.get("error") or "Registration failed."
             err = str(result.get("error", "")).strip().upper()
-            if err == "DEVICE_ALREADY_REGISTERED":
-                self._set_status(
-                    "Device limit reached (5/5 machines active). Please contact Deckmount support to free up a slot.",
-                    "#c0392b",
-                )
-                QMessageBox.critical(
-                    self,
-                    "Device Limit Reached",
-                    "Device limit reached (5/5 machines active). Please contact Deckmount support to free up a slot.",
-                )
+            # Match on the machine-readable code AND on the server's prose. The
+            # deployed Lambda reports an exhausted licence as the sentence
+            # "No available seats for this license." rather than a code, so keying
+            # only off DEVICE_ALREADY_REGISTERED left the useful dialog below
+            # unreachable and the user got a one-line red label instead.
+            haystack = f"{err} {str(msg).strip().upper()}"
+
+            def _fail(title: str, body: str) -> None:
+                self._set_status(body, "#c0392b")
+                QMessageBox.critical(self, title, body)
                 self._register_btn.setEnabled(True)
+
+            if err in ("LICENSE_REVOKED", "ACCOUNT_REVOKED") or "REVOKED" in haystack:
+                # Revocation blocks re-registration; only Deckmount can free the seat.
+                from utils.license_manager import REVOKED_MESSAGE
+                _fail("License Revoked", REVOKED_MESSAGE)
                 return
+
+            if (
+                err in ("DEVICE_ALREADY_REGISTERED", "NO_SEATS", "DEVICE_LIMIT_REACHED")
+                or "NO AVAILABLE SEATS" in haystack
+                or "SEAT(S) FOR THIS LICENSE ARE IN USE" in haystack
+                or "ALL SEATS" in haystack
+            ):
+                _fail(
+                    "Device Limit Reached",
+                    "Device limit reached — all machines for this licence are in use.\n\n"
+                    "Please contact Deckmount support to free up a slot.",
+                )
+                return
+
+            if result.get("offline") or "INTERNAL SERVER ERROR" in haystack:
+                _fail(
+                    "Registration Unavailable",
+                    "Could not reach the Deckmount licence server.\n\n"
+                    "Check this computer's internet connection and try again. "
+                    "If the problem continues, contact Deckmount support.",
+                )
+                return
+
             self._set_status(f"Error: {msg}", "#e74c3c")
             self._register_btn.setEnabled(True)
 

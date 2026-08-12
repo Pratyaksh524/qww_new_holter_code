@@ -285,3 +285,6 @@ Thumbs.db
 local_config.json
 user_config.json
 ecg_history.json
+# The .env template must be committed: it is the only place documenting which
+# variables the app needs. It holds names and placeholders, never real values.
+!.env.example

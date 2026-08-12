@@ -71,9 +71,15 @@ SOFTWARE_VERSION: str = "2.0.0"
 PRODUCT_CODE: str = "CARDIOX"
 
 # Offline grace window (days) — app runs without internet for this many days.
-OFFLINE_GRACE_DAYS: int = 14
+# After this window the app blocks and requires an internet connection to reactivate.
+OFFLINE_GRACE_DAYS: int = 7
 # How many seconds between mandatory server heartbeats.
 HEARTBEAT_INTERVAL_SECONDS: int = OFFLINE_GRACE_DAYS * 86400
+# Once this many days (or fewer) of the offline window remain, the UI warns the user
+# on every launch that internet is required for verification and that the software will
+# otherwise stop. The heartbeat is mandatory by design: it is what prevents a one-time
+# signup from being used indefinitely on a machine that never contacts the server again.
+OFFLINE_WARNING_DAYS: int = 3
 
 # ── RhythmUltra USB Identity ───────────────────────────────────────────────────
 # Set RhythmUltra_VID / RhythmUltra_PID in .env or environment.
@@ -1187,16 +1193,46 @@ class StartupCheckResult:
         )
 
 
+# Machine-readable revocation codes returned by the license Lambdas.
+# cardiox-license-heartbeat returns LICENSE_REVOKED when licenses.status is
+# 'revoked' (what cardiox-license-admin-revoke sets) and ACCOUNT_REVOKED when
+# the individual seat has been revoked by an administrator. Both mean the same
+# thing to the client: wipe the license and make the user register again.
+_REVOCATION_CODES = frozenset({"LICENSE_REVOKED", "ACCOUNT_REVOKED"})
+
+# Shown verbatim whenever the license is revoked, regardless of which code or
+# wording the server sent. The server's own text varies ("License revoked.
+# Please contact Deckmount." vs "Account revoked by administrator.") and the
+# latter never tells the user what to do, so the client always states the one
+# instruction that matters: contact Deckmount support.
+REVOKED_MESSAGE: str = (
+    "License is revoked.\n\n"
+    "This software has been deactivated on this device.\n"
+    "Please contact Deckmount support."
+)
+
+
 def _is_explicit_revocation(payload: Dict) -> bool:
     """Return True only when the server explicitly says the license is revoked."""
     if not isinstance(payload, dict):
         return False
-    error_code = str(payload.get("error_code", "")).strip().upper()
-    if error_code == "LICENSE_REVOKED" or bool(payload.get("revoked")):
+    # The license Lambdas put the machine-readable code in `error`
+    # (e.g. {"error": "LICENSE_REVOKED", "message": "License revoked. ..."}),
+    # while some endpoints use `error_code`. Check both as codes first so
+    # detection does not depend on the server's human-readable wording.
+    for field in ("error_code", "error"):
+        if str(payload.get(field, "")).strip().upper() in _REVOCATION_CODES:
+            return True
+    if bool(payload.get("revoked")):
         return True
+    # Prose fallback, kept for older server builds that only send a message.
     message = str(payload.get("message", "")).strip().lower()
     error = str(payload.get("error", "")).strip().lower()
-    return "license revoked" in message or "license revoked" in error
+    return any(
+        phrase in text
+        for text in (message, error)
+        for phrase in ("license revoked", "account revoked")
+    )
 
 
 def run_startup_checks(force_heartbeat: bool = False) -> StartupCheckResult:
@@ -1353,10 +1389,7 @@ def run_startup_checks(force_heartbeat: bool = False) -> StartupCheckResult:
             if _is_explicit_revocation(hb_result):
                 res.step_failed = 5
                 res.error_code = "LICENSE_REVOKED"
-                res.reason = hb_result.get(
-                    "message",
-                    "License has been revoked. Please contact Deckmount support.",
-                )
+                res.reason = REVOKED_MESSAGE
                 return res
 
             if server_token_failure:
@@ -1490,15 +1523,17 @@ def run_startup_checks(force_heartbeat: bool = False) -> StartupCheckResult:
     # ── Check 5: Server heartbeat ─────────────────────────────────────────────
     hb_result = heartbeat(token)
     if hb_result.get("offline"):
-        if token.get("signature_invalid"):
-            res.step_failed = 2
-            res.error_code = "TOKEN_INVALID"
-            res.reason = (
-                "License token is invalid or has been tampered with.\n"
-                "An internet connection is required to verify your license."
-            )
-            return res
-
+        # NOTE: there is deliberately no "signature_invalid -> token tampered" branch
+        # here any more. Tokens are signed by the server with JWT_SECRET, while the
+        # client only holds LICENSE_HMAC_SECRET, so the offline signature comparison
+        # fails for every genuine token. Treating that as tampering made step 2 fire
+        # on the first offline launch, which wiped the licence (main.py clears
+        # credentials for steps 1 and 2) and demanded a re-registration the user could
+        # not perform without internet. The offline grace window below is what governs
+        # offline use; exhausting it must never wipe credentials.
+        #
+        # Real tamper detection lives on the server heartbeat. To detect it offline as
+        # well, move token signing to RS256 and ship only the public key in the app.
         last_check = int(
             token.get("last_successful_server_time")
             or token.get("last_successful_server_validation")
@@ -1510,8 +1545,9 @@ def run_startup_checks(force_heartbeat: bool = False) -> StartupCheckResult:
             res.step_failed = 5
             res.error_code = "LICENSE_VERIFICATION_REQUIRED"
             res.reason = (
-                "License verification required.\n"
-                "Please connect to the internet."
+                f"Your {OFFLINE_GRACE_DAYS}-day offline period has ended.\n\n"
+                "An internet connection is required to reactivate this license.\n"
+                "Please connect to the internet and sign in again."
             )
             return res
 
@@ -1527,23 +1563,37 @@ def run_startup_checks(force_heartbeat: bool = False) -> StartupCheckResult:
             offline_meta["seat_number"] = token["seat_number"]
         _save_license_meta(offline_meta)
 
+        # Round up: with <24h left, truncating would report "0 day(s) remaining"
+        # while the app is in fact still usable.
+        days_remaining = -(-grace_remaining // 86400)
         print(
-            f"[License] Offline — {int(grace_remaining / 86400)} day(s) of grace remaining."
+            f"[License] Offline — {days_remaining} day(s) of grace remaining."
         )
         res.ok = True
         res.offline_mode = True
-        res.reason = (
-            f"Offline mode active. {int(grace_remaining / 86400)} day(s) remaining before verification is required."
-        )
+        # Surface the countdown to the caller. The UI warns the user once this drops
+        # to OFFLINE_WARNING_DAYS or fewer, so a mandatory server verification never
+        # arrives as a surprise shutdown.
+        res.days_remaining = days_remaining
+        if days_remaining <= OFFLINE_WARNING_DAYS:
+            res.reason = (
+                f"Internet connection required for licence verification.\n\n"
+                f"This software has been offline for some time and will stop working in "
+                f"{days_remaining} day(s) unless it can verify your licence with the "
+                f"Deckmount server.\n\n"
+                f"Please connect this computer to the internet."
+            )
+        else:
+            res.reason = (
+                f"Offline mode active. {days_remaining} day(s) remaining before "
+                "an internet connection is required to reactivate."
+            )
         return res
 
     if _is_explicit_revocation(hb_result):
         res.step_failed = 5
         res.error_code = "LICENSE_REVOKED"
-        res.reason = hb_result.get(
-            "message",
-            "License has been revoked. Please contact Deckmount support.",
-        )
+        res.reason = REVOKED_MESSAGE
         return res
 
     if not hb_result.get("valid", False) and not hb_result.get("authorized", False):
