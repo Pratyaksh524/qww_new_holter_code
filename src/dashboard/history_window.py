@@ -1005,7 +1005,6 @@ class HistoryWindow(QDialog):
 
         shortcuts = [
             ("History Window", "Ctrl + P", "Preview selected report in side panel"),
-            ("History Window", "Ctrl + E", "Open Email dialog for selected report"),
             ("History Window", "Ctrl + O", "Open selected report in system PDF viewer"),
             ("History Window", "Ctrl + F", "Jump cursor focus to Search bar"),
             ("History Window", "Ctrl + D", "Export selected report as DICOM file"),

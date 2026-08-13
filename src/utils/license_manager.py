@@ -1212,6 +1212,184 @@ REVOKED_MESSAGE: str = (
 )
 
 
+# Seat-state codes that mean "the token cached on this device points at a seat
+# the server has superseded" — the licence itself is healthy, only the local copy
+# is out of date. The server moves a machine onto a new seat row whenever it
+# registers again and deactivates the previous one, which leaves cardiox.lic one
+# seat behind and every later heartbeat answering SEAT_INACTIVE.
+#
+# These must NEVER be treated as revocation or as "seat missing": the fix is to
+# re-sync the token from the server, not to wipe the licence and push the user
+# back through Sign Up. Re-registering only mints yet another seat and repeats
+# the same failure on the next launch.
+_STALE_SEAT_CODES = frozenset({
+    "SEAT_INACTIVE",
+    "SEAT_RELEASED",
+    "SEAT_NOT_FOUND",
+    "SEAT_MISMATCH",
+    "TOKEN_SEAT_MISMATCH",
+    "INVALID_TOKEN",
+    "TOKEN_INVALID",
+    "TOKEN_EXPIRED",
+})
+
+_STALE_SEAT_PHRASES = (
+    "seat inactive",
+    "seat is inactive",
+    "seat released",
+    "seat not found",
+    "seat or user not found",
+    "not registered under this license",
+    "please register first",
+    "invalid token",
+    "token mismatch",
+)
+
+
+def is_stale_seat_error(error_code: str = "", reason: str = "") -> bool:
+    """True when a heartbeat failure only means the cached token is out of date."""
+    if str(error_code or "").strip().upper() in _STALE_SEAT_CODES:
+        return True
+    text = str(reason or "").strip().lower()
+    return any(phrase in text for phrase in _STALE_SEAT_PHRASES)
+
+
+def _wire_password(password: str) -> str:
+    """
+    Return the password form the license server holds for this device.
+
+    register_device() sends the SHA-256 hash of the password rather than the
+    password itself, and the server bcrypts whatever it receives. Any later
+    credential check must send the same hash or bcrypt.compare rejects a
+    perfectly correct password.
+    """
+    return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
+
+
+def validate_with_credentials(username: str, password: str) -> Dict:
+    """
+    POST /validate with the user's sign-in credentials.
+
+    Two things vary and both are tried, cheapest first:
+
+    * Identifier — the server resolves a seat by phone, full name or machine
+      serial. A full name can still match a seat this device has since replaced
+      (answering SEAT_INACTIVE), so the phone recorded at registration is tried
+      as well.
+    * Password form — register_device() sends the SHA-256 hash, so the hash is
+      tried first; the raw password is retried for seats created by builds that
+      posted it directly.
+    """
+    machine_ctx = get_machine_context()
+    fingerprint = get_hardware_fingerprint()
+    token = load_token_file() or {}
+    serial = get_rhythmultra_serial() or token.get(
+        "rhythmultra_serial",
+        token.get("RhythmUltra_serial", token.get("rhythmulta_serial", "")),
+    )
+    machine_serial = machine_ctx.get("machine_serial_id", "")
+
+    identifiers = [str(username or "").strip()]
+    profile_phone = str(load_registration_profile().get("phone", "")).strip()
+    if profile_phone and profile_phone not in identifiers:
+        identifiers.append(profile_phone)
+
+    def _attempt(identifier: str, secret: str) -> Dict:
+        body = {
+            "username": identifier,
+            "phone": identifier,
+            "password": secret,
+            "hardware_fingerprint": fingerprint,
+            "stable_hardware_fingerprint": _stable_hardware_fingerprint(),
+            "bios_serial": machine_serial,
+            "machine_serial_id": machine_serial,
+            "pc_name": machine_ctx.get("machine_name", ""),
+            "RhythmUltra_serial": serial,
+            "rhythmultra_serial": serial,
+            "rhythmulta_serial": serial,
+        }
+        res = _post_json("validate", body)
+        _verify_server_sig(res)
+        return res
+
+    last: Dict = {"valid": False, "error": "NO_CREDENTIALS"}
+    for identifier in identifiers:
+        if not identifier:
+            continue
+        for secret in (_wire_password(password), password):
+            last = _attempt(identifier, secret)
+            if last.get("valid") or last.get("success") or last.get("authorized"):
+                return last
+            if last.get("offline"):
+                return last
+            # A seat-state answer is about the seat this identifier resolved to,
+            # not the password, so retrying the same identifier with the other
+            # password form cannot change it. Move to the next identifier instead
+            # and save a round-trip — each one costs the user roughly a second at
+            # the login screen.
+            if is_stale_seat_error(
+                str(last.get("error_code", "") or last.get("error", "")),
+                str(last.get("message", "")),
+            ):
+                break
+    return last
+
+
+def resync_token_from_credentials(username: str, password: str) -> bool:
+    """
+    Replace the cached token with the one the server currently holds for this
+    device, using the credentials the user just signed in with.
+
+    Returns True only when a fresh server-issued token was written to disk. This
+    is the repair path for a stale seat: same licence, same seat, and the user
+    sees nothing.
+    """
+    try:
+        result = validate_with_credentials(username, password)
+    except Exception as e:
+        print(f"[License] Token re-sync failed: {e}")
+        return False
+
+    if not (result.get("valid") or result.get("success") or result.get("authorized")):
+        return False
+
+    token_payload = result.get("token")
+    if isinstance(token_payload, str) and token_payload.strip().count(".") == 2:
+        save_token_file(token_payload.strip())
+    elif isinstance(token_payload, dict):
+        save_token_file(token_payload.get("payload", token_payload))
+    else:
+        # Nothing to install — the caller keeps the existing failure path.
+        return False
+
+    now = _current_unix_time()
+    meta = {
+        "fingerprint": get_hardware_fingerprint(),
+        "stable_fingerprint": _stable_hardware_fingerprint(),
+        "last_server_check": now,
+        "last_successful_server_validation": now,
+        "last_successful_server_time": now,
+        "last_local_time": now,
+    }
+    seat_number = result.get("seat_number")
+    if seat_number is not None:
+        meta["seat_number"] = seat_number
+    _save_license_meta(meta)
+
+    license_key = str(result.get("license_key", "")).strip()
+    if license_key:
+        save_stored_key(license_key)
+
+    _append_audit_event(
+        "LICENSE_TOKEN_RESYNCED",
+        license_key=license_key or load_stored_key(),
+        seat_number=seat_number,
+        machine_serial_id=get_machine_context().get("machine_serial_id", ""),
+    )
+    print(f"[License] Token re-synced from server (seat {seat_number}).")
+    return True
+
+
 def _is_explicit_revocation(payload: Dict) -> bool:
     """Return True only when the server explicitly says the license is revoked."""
     if not isinstance(payload, dict):
@@ -1598,7 +1776,16 @@ def run_startup_checks(force_heartbeat: bool = False) -> StartupCheckResult:
 
     if not hb_result.get("valid", False) and not hb_result.get("authorized", False):
         res.step_failed = 5
-        res.error_code = str(hb_result.get("error_code", "")).strip().upper() or "LICENSE_BLOCKED"
+        # The license Lambdas put the machine-readable code in `error`
+        # ({"error": "SEAT_INACTIVE", "message": "Seat inactive."}); only some
+        # endpoints use `error_code`. Reading `error_code` alone collapsed every
+        # server refusal into the LICENSE_BLOCKED fallback, which the login gate
+        # then mistook for a missing seat and offered to wipe a valid licence.
+        res.error_code = (
+            str(hb_result.get("error_code", "")).strip().upper()
+            or str(hb_result.get("error", "")).strip().upper()
+            or "LICENSE_BLOCKED"
+        )
         res.reason = hb_result.get(
             "message",
             hb_result.get(

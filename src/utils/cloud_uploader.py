@@ -83,9 +83,49 @@ except Exception:
     pass
 
 
+# Report files are named  <DEVICE>_<YYYYMMDD>_<HHMMSS>.<ext>  — e.g.
+# "ECG_Report_12_1_DM ECG V1.0 A010_20260810_154532.pdf" → ("A010", "20260810",
+# "154532"). This triple is the report's identity everywhere in the pipeline:
+# the doctor-review Lambda parses it out of the filename it is given and looks
+# for the report under that device and date. Anything filed elsewhere is
+# invisible to it and comes back as HTTP 404 "Old Report not supported."
+_REPORT_IDENTITY_RE = re.compile(r'([A-Za-z0-9]{2,20})_(\d{8})_(\d{6})\.[A-Za-z0-9]+$')
+
+# Reports whose name carries the timestamp but no device token
+# ("ECG_Report_12_1_20260810_154532.pdf"). The backend accepts these when the
+# device id is supplied separately, so the date is still usable for filing.
+_REPORT_TIMESTAMP_RE = re.compile(r'_(\d{8})_(\d{6})\.[A-Za-z0-9]+$')
+
+
+def _report_identity(filename: str):
+    """
+    Return (device_id, 'YYYYMMDD', 'HHMMSS') parsed from a report filename.
+
+    Returns None when the name carries no device token, in which case callers
+    fall back to the device this machine is registered to.
+    """
+    match = _REPORT_IDENTITY_RE.search(str(filename or "").strip())
+    if not match:
+        return None
+    return match.group(1).upper(), match.group(2), match.group(3)
+
+
+def _report_timestamp(filename: str):
+    """Return ('YYYYMMDD', 'HHMMSS') from a report filename, or None."""
+    match = _REPORT_TIMESTAMP_RE.search(str(filename or "").strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _identity_date_path(date_str: str) -> str:
+    """'20260810' → '2026/08/10'."""
+    return f"{date_str[0:4]}/{date_str[4:6]}/{date_str[6:8]}"
+
+
 class CloudUploader:
     """Handle uploading ECG reports to cloud storage with offline queue support"""
-    
+
     def __init__(self):
         self.cloud_service = os.getenv('CLOUD_SERVICE', 'none').lower()
         self.upload_enabled = os.getenv('CLOUD_UPLOAD_ENABLED', 'false').lower() == 'true'
@@ -272,33 +312,66 @@ class CloudUploader:
         key_filename = filename
 
         prefix = (os.getenv("S3_REPORTS_PREFIX", "reports") or "reports").strip().strip("/")
-        
-        # Get RhythmUltra device serial and extract last 4 digits (fallback to 0000)
+
+        # The report's own identity decides where it is filed — NOT the clock or
+        # whichever device happens to be plugged in right now. A report recorded
+        # on the 10th but uploaded on the 12th used to land under 2026/08/12, and
+        # one uploaded with the RhythmUltra unplugged landed under "0000" even
+        # though its filename says A010. Either mismatch makes the review Lambda
+        # (which matches on device id + the <DEVICE>_<DATE>_<TIME>.pdf key suffix)
+        # answer "Old Report not supported."
+        machine_serial_dir, date_path = self._report_location(filename)
+
+        mobile = self._extract_mobile_for_s3_key(meta)
+        if mobile:
+            return f"{prefix}/{mobile}/{machine_serial_dir}/{key_filename}"
+        return f"{prefix}/{date_path}/{machine_serial_dir}/{key_filename}"
+
+    def _report_location(self, filename: str) -> tuple:
+        """
+        Return (device_dir, 'YYYY/MM/DD') for a report file.
+
+        Both come from the report's own name where possible; the device falls
+        back to this machine's RhythmUltra serial (connected, else registered)
+        and the date to today only when the name carries neither.
+        """
+        identity = _report_identity(filename)
+        if identity:
+            device, date_str, _ = identity
+            # For a PDF the filename token IS the device the backend will look
+            # the report up under, so it always wins. Sidecars (JSON payloads,
+            # HL7) are never looked up that way and some are named after the
+            # user's phone number — "12_lead_9560350477_20260810_175623.json"
+            # would otherwise create a folder named after the phone — so those
+            # keep this machine's device folder unless the token looks like a
+            # device tag (short, not all digits, e.g. A010).
+            is_pdf = str(filename).lower().endswith(".pdf")
+            if is_pdf or (len(device) <= 6 and not device.isdigit()):
+                return device, _identity_date_path(date_str)
+
+        stamp = _report_timestamp(filename)
+        date_path = _identity_date_path(stamp[0]) if stamp else datetime.now().strftime("%Y/%m/%d")
+
         machine_serial = ""
         try:
             from utils.license_manager import get_rhythmultra_serial
             machine_serial = get_rhythmultra_serial() or ""
         except Exception:
-            # Fallback to license profile
+            machine_serial = ""
+        if not machine_serial:
             try:
                 from utils.license_manager import load_registration_profile
                 profile = load_registration_profile()
-                machine_serial = (profile.get("rhythmultra_serial") 
-                                  or profile.get("rhythmulta_serial") 
-                                  or profile.get("RhythmUltra_serial") 
+                machine_serial = (profile.get("rhythmultra_serial")
+                                  or profile.get("rhythmulta_serial")
+                                  or profile.get("RhythmUltra_serial")
                                   or "")
             except Exception:
                 machine_serial = ""
-        
-        # Process machine serial: keep only alphanumeric chars, get last 4
+
         machine_serial_clean = ''.join(c for c in machine_serial if c.isalnum())
-        machine_serial_dir = machine_serial_clean[-4:] if len(machine_serial_clean) >= 4 else "0000"
-        
-        mobile = self._extract_mobile_for_s3_key(meta)
-        if mobile:
-            return f"{prefix}/{mobile}/{machine_serial_dir}/{key_filename}"
-        timestamp = datetime.now().strftime("%Y/%m/%d")
-        return f"{prefix}/{timestamp}/{machine_serial_dir}/{key_filename}"
+        device_dir = machine_serial_clean[-4:].upper() if len(machine_serial_clean) >= 4 else "0000"
+        return device_dir, date_path
     
     def _is_file_already_uploaded(self, file_path):
         """
@@ -989,29 +1062,12 @@ class CloudUploader:
             if not sanitized_name:
                 sanitized_name = "Unknown"
 
-            now = datetime.now()
-            year = now.strftime("%Y")
-            month = now.strftime("%m")
-            day = now.strftime("%d")
-            
-            # Get RhythmUltra device serial and extract last 4 digits (fallback to 0000)
-            machine_serial = ""
-            try:
-                from utils.license_manager import get_rhythmultra_serial
-                machine_serial = get_rhythmultra_serial() or ""
-            except Exception:
-                # Fallback to license profile
-                machine_serial = (profile.get("rhythmultra_serial") 
-                                  or profile.get("rhythmulta_serial") 
-                                  or profile.get("RhythmUltra_serial") 
-                                  or "")
-            
-            machine_serial_clean = ''.join(c for c in machine_serial if c.isalnum())
-            machine_serial_dir = machine_serial_clean[-4:] if len(machine_serial_clean) >= 4 else "0000"
-            
-            # S3 prefix and keys with patient name and report_id for easy identification
+            # S3 prefix and keys with patient name and report_id for easy identification.
+            # The device folder and date come from the report's own filename identity
+            # so the review Lambda can find it — see _report_location().
             pdf_filename = os.path.basename(pdf_path) if pdf_path else f"{sanitized_name}_{report_id}.pdf"
-            s3_prefix = f"reports/{year}/{month}/{day}/{machine_serial_dir}/{report_id}"
+            machine_serial_dir, date_path = self._report_location(pdf_filename)
+            s3_prefix = f"reports/{date_path}/{machine_serial_dir}/{report_id}"
             package_s3_key = f"{s3_prefix}/{sanitized_name}_{report_id}.json"
             pdf_s3_key = f"{s3_prefix}/{pdf_filename}"
 
@@ -1618,21 +1674,13 @@ class CloudUploader:
             if not RhythmUltra_serial:
                 RhythmUltra_serial = "DM ECG V1.0 A010"
 
-            # Extract device_id_short from the filename first (same regex as Lambda server).
-            # This ensures the deviceId we send matches what the Lambda extracts from the
-            # filename, making findReportByFileIdentity succeed.
-            import re as _re
-            _fn_match = _re.search(
-                r'([A-Z0-9]{2,20})_(\d{8})_(\d{6})\.pdf$',
-                filename,
-                _re.IGNORECASE,
-            )
-            if _fn_match:
-                device_id_short = _fn_match.group(1).upper()
-                print(f"  → deviceId from filename regex: {device_id_short}")
-            else:
-                _ser_clean = ''.join(c for c in RhythmUltra_serial if c.isalnum())
-                device_id_short = _ser_clean[-4:] if len(_ser_clean) >= 4 else (_ser_clean or "0000")
+            # The deviceId must be the one the report is filed under in S3, because
+            # the Lambda matches the assignment against the stored report's device id
+            # and its <DEVICE>_<DATE>_<TIME>.pdf key suffix. _report_location() is the
+            # single source of that answer, so the upload and the assignment can never
+            # disagree about which device a report belongs to.
+            device_id_short, _report_date_path = self._report_location(filename)
+            print(f"  → deviceId={device_id_short} (report filed under reports/{_report_date_path}/{device_id_short}/)")
 
             api_headers = {}
             if self.doctor_review_api_key:

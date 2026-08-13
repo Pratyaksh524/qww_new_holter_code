@@ -270,6 +270,105 @@ class HyperkalemiaTestWindow(QWidget):
         self.duration_timer = QTimer(self)
         self.duration_timer.timeout.connect(self.check_duration)
 
+    # ── Lead II history ────────────────────────────────────────────────────────
+    # Written on every sample but only ever consumed as a whole array, so it is
+    # held as an index-addressed ring. Writing used to be np.roll() per sample,
+    # which copies the entire 10,000-element buffer 500 times a second — about
+    # 5 million element moves per second for a buffer nothing reads during
+    # capture. The chronological view is now rebuilt only when asked for.
+    @property
+    def data(self):
+        ring = self._lead_ii_ring
+        pos = int(self._lead_ii_pos)
+        if pos == 0:
+            return ring.copy()
+        return np.concatenate((ring[pos:], ring[:pos]))
+
+    @data.setter
+    def data(self, value):
+        arr = np.asarray(value, dtype=np.float32)
+        self._lead_ii_ring = arr.copy()
+        self._lead_ii_pos = 0
+
+    def _push_lead_ii(self, value):
+        """Append one Lead II sample in O(1)."""
+        ring = self._lead_ii_ring
+        ring[self._lead_ii_pos] = value
+        self._lead_ii_pos = (self._lead_ii_pos + 1) % ring.size
+
+    def _ring_push(self, lead_name, value):
+        """Append one display sample for a lead in O(1)."""
+        ring = self._ring_bufs.get(lead_name)
+        if ring is None:
+            return
+        pos = int(self._ring_pos.get(lead_name, 0))
+        ring[pos] = value
+        self._ring_pos[lead_name] = (pos + 1) % ring.size
+        self._ring_active[lead_name] = min(ring.size, self._ring_active.get(lead_name, 0) + 1)
+
+    def _ring_tail(self, lead_name, count):
+        """Most recent `count` samples for a lead, oldest first."""
+        ring = self._ring_bufs.get(lead_name)
+        if ring is None or count <= 0:
+            return np.empty(0, dtype=float)
+        count = int(min(count, ring.size))
+        pos = int(self._ring_pos.get(lead_name, 0))
+        start = pos - count
+        if start >= 0:
+            return np.asarray(ring[start:pos], dtype=float)
+        return np.asarray(np.concatenate((ring[start:], ring[:pos])), dtype=float)
+
+    # Display constants mirrored from the 12-lead test so both windows render a
+    # trace the same way (twelve_lead_test.py: SMOOTH_SIGMA, INTERP_FACTOR,
+    # _baseline_alpha_slow).
+    _SMOOTH_SIGMA = 0.8
+    _BASELINE_ALPHA_SLOW = 0.0005
+    # Plot every 2nd sample: 250 Hz effective, still ten times the 25 Hz filter
+    # cutoff, and about two points per pixel column in a 900 px lane.
+    _DISPLAY_DECIMATION = 2
+
+    @staticmethod
+    def _decimate_for_display(signal, factor):
+        """
+        Thin the trace for plotting without losing peaks.
+
+        The last sample is always kept so the newest data stays pinned to the
+        right edge of the scrolling window.
+        """
+        try:
+            arr = np.asarray(signal, dtype=float)
+            if arr.size < 4 or factor <= 1:
+                return arr
+            thinned = arr[::int(factor)]
+            if thinned.size and thinned[-1] != arr[-1]:
+                thinned = np.append(thinned, arr[-1])
+            return thinned
+        except Exception:
+            return np.asarray(signal, dtype=float)
+
+    def _apply_lead_off_verdict(self, lead_name, looks_off):
+        """
+        Latch a lead-off verdict only after it holds for a sustained stretch.
+
+        Blanking a lead replaces its samples with a constant in the display, the
+        analysis buffer and the recording, so momentary agreement from the
+        detector — a motion artifact, a noisy beat — must not be enough to do it.
+        """
+        engage = int(getattr(self, "_LEAD_OFF_ENGAGE_PACKETS", 250))
+        release = int(getattr(self, "_LEAD_OFF_RELEASE_PACKETS", 100))
+        currently_off = bool(self._lead_off_state.get(lead_name, False))
+
+        if looks_off:
+            self._lead_off_off_count[lead_name] = 0
+            self._lead_off_on_count[lead_name] = self._lead_off_on_count.get(lead_name, 0) + 1
+            if not currently_off and self._lead_off_on_count[lead_name] >= engage:
+                self._lead_off_state[lead_name] = True
+        else:
+            self._lead_off_on_count[lead_name] = 0
+            self._lead_off_off_count[lead_name] = self._lead_off_off_count.get(lead_name, 0) + 1
+            if currently_off and self._lead_off_off_count[lead_name] >= release:
+                self._lead_off_state[lead_name] = False
+
     def _init_plot_and_lead_off_buffers(self):
         # Keep a slightly larger buffer than the visible window for stable filtering.
         fs = float(self.sampling_rate or 500.0)
@@ -289,12 +388,25 @@ class HyperkalemiaTestWindow(QWidget):
 
         self._lead_off_windows = {}
         self._lead_off_state = {}
+        # Debounce counters. A lead-off verdict blanks the lead everywhere — screen,
+        # analysis buffer and the recording the report is drawn from — so a single
+        # detector window must not be able to trigger it. The 12-lead test latches
+        # its verdict the same way, which is why it keeps showing waves in
+        # situations where this window used to go flat.
+        self._lead_off_on_count = {}
+        self._lead_off_off_count = {}
         window_len = int(1.0 * fs)
         if window_len < 50:
             window_len = 50
+        # Engage after half a second of continuous agreement; release after a fifth
+        # of a second, so a lead that comes back is shown again almost immediately.
+        self._LEAD_OFF_ENGAGE_PACKETS = max(50, int(0.5 * fs))
+        self._LEAD_OFF_RELEASE_PACKETS = max(20, int(0.2 * fs))
         for lead_name in self.lead_indices.keys():
             self._lead_off_windows[lead_name] = deque(maxlen=window_len)
             self._lead_off_state[lead_name] = False
+            self._lead_off_on_count[lead_name] = 0
+            self._lead_off_off_count[lead_name] = 0
 
         # Reset connection tracking
         self._lead_last_valid_value = {name: self._adc_center for name in self.lead_indices.keys()}
@@ -313,8 +425,12 @@ class HyperkalemiaTestWindow(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         import pyqtgraph as pg
-        # Antialiasing: ON to ensure smooth waves without stair-step jagged edges.
-        pg.setConfigOptions(antialias=True)
+        # Antialiasing smooths the trace but roughly triples line-drawing cost, which
+        # is the difference between a steady scroll and a stuttering one on the 8 GB /
+        # i3 minimum spec. Off there, on everywhere else — on an ECG line the
+        # difference is barely perceptible (see smooth_display.py, which never
+        # enables it).
+        pg.setConfigOptions(antialias=not is_low_spec_mode())
         
         self.setStyleSheet("""
             QWidget { background: #0D1117; color: #F9FAFB; }
@@ -526,7 +642,11 @@ class HyperkalemiaTestWindow(QWidget):
             plot_widget.setStyleSheet("border: none;")
             plot_widget.showGrid(x=False, y=False)
             plot_widget.setClipToView(True)
-            plot_widget.setDownsampling(auto=True, mode='peak')
+            # Same as the 12-lead test: no downsampling, plain polyline. Auto
+            # 'peak' downsampling collapses each pixel column to a min/max pair
+            # and draws the trace as vertical bars, so the background shows
+            # through between them — the black speckle inside the green line.
+            plot_widget.setDownsampling(ds=1, auto=False, mode='subsample')
             plot_widget.setMouseEnabled(x=False, y=False)
             
             # Hide Y-axis numeric labels (clean clinical look)
@@ -566,7 +686,7 @@ class HyperkalemiaTestWindow(QWidget):
                     pass
 
             plot_curve = plot_widget.plot(
-                pen=pg.mkPen(color='#00DD00', width=1.5), connect='finite'
+                pen=pg.mkPen(color='#00FF00', width=2.0), connect='finite'
             )
 
             self.plot_widgets[lead_name] = plot_widget
@@ -753,6 +873,7 @@ class HyperkalemiaTestWindow(QWidget):
                 for lead in self.lead_data.keys()
             }
             self._ring_active = {lead: 0 for lead in self.lead_data.keys()}
+            self._ring_pos = {lead: 0 for lead in self.lead_data.keys()}
 
             # Reset display anchors and warmup so trace starts clean (same as HRV test)
             if hasattr(self, "_display_anchors"):
@@ -1182,7 +1303,9 @@ class HyperkalemiaTestWindow(QWidget):
             n_new = len(packets)
             # Process each packet
             for packet in packets:
-                self.active_samples = min(len(self.data), self.active_samples + 1)
+                # Ring size directly — len(self.data) would rebuild the whole
+                # chronological array on every packet just to read its length.
+                self.active_samples = min(self._lead_ii_ring.size, self.active_samples + 1)
 
                 # ── Feed packet to HolterBPMController ──────────────────────────
                 try:
@@ -1215,20 +1338,24 @@ class HyperkalemiaTestWindow(QWidget):
                                 if not was_connected:
                                     # Clear OFF state immediately on reconnection; detector will re-evaluate within 1s.
                                     self._lead_off_state[lead_name] = False
+                                    self._lead_off_on_count[lead_name] = 0
+                                    self._lead_off_off_count[lead_name] = 0
 
-                                # Lead-off detection (same thresholds used by 12-lead) on connected streams.
+                                # Lead-off detection (same thresholds used by 12-lead) on connected
+                                # streams, debounced so one window cannot blank the lead.
                                 try:
                                     w = self._lead_off_windows.get(lead_name)
                                     if w is not None:
                                         w.append(raw_value)
                                         if len(w) >= 50:
-                                            self._lead_off_state[lead_name] = bool(
+                                            looks_off = bool(
                                                 detect_lead_off(
                                                     np.asarray(w, dtype=float),
                                                     sampling_rate=float(self.sampling_rate or 500.0),
                                                     window_size=1.0
                                                 )
                                             )
+                                            self._apply_lead_off_verdict(lead_name, looks_off)
                                 except Exception:
                                     pass
 
@@ -1248,18 +1375,11 @@ class HyperkalemiaTestWindow(QWidget):
 
                             # Circular display buffer for scrolling window rendering
                             if lead_name in self.lead_data and hasattr(self, "_ring_bufs"):
-                                ring = self._ring_bufs.get(lead_name)
-                                if ring is not None:
-                                    self._ring_bufs[lead_name] = np.roll(ring, -1)
-                                    self._ring_bufs[lead_name][-1] = value_for_buffers
-                                    self._ring_active[lead_name] = min(
-                                        len(ring), self._ring_active.get(lead_name, 0) + 1
-                                    )
+                                self._ring_push(lead_name, value_for_buffers)
 
                             # Primary Lead II backup
                             if lead_name == 'II':
-                                self.data = np.roll(self.data, -1)
-                                self.data[-1] = value_for_buffers
+                                self._push_lead_ii(value_for_buffers)
                                 self.lead_ii_data.append({'time': packet_time, 'value': value_for_buffers})
                         except Exception as e:
                             # Per-lead failure must not block other leads (prevents "freeze all" bug)
@@ -1288,6 +1408,10 @@ class HyperkalemiaTestWindow(QWidget):
             )
             from ecg.utils.helpers import get_display_gain
 
+            # Fixed filter set for this test — AC 50 Hz, EMG 25 Hz, baseline 0.5 Hz —
+            # applied identically on screen and in the report. Deliberately NOT read
+            # from the settings screen: only the 12-lead test is user-configurable,
+            # so a hyperkalemia trace always looks the same regardless of settings.
             ac_val = "50"
             emg_val = "25"
             dft_val = "0.5"
@@ -1328,7 +1452,12 @@ class HyperkalemiaTestWindow(QWidget):
                 window_samples = max(50, int(window_seconds * fs))
                 window_samples = min(window_samples, valid_count)
 
-                buffer_data = np.asarray(ring[-window_samples:], dtype=float)
+                # Pull only the visible window out of the ring — the samples are
+                # stored in write order now, so the tail helper reassembles them
+                # chronologically without touching the rest of the buffer.
+                buffer_data = self._ring_tail(lead_name, window_samples)
+                if buffer_data.size == 0:
+                    continue
                 if lead_is_off:
                     buffer_data = np.full_like(buffer_data, self._adc_center)
 
@@ -1362,31 +1491,57 @@ class HyperkalemiaTestWindow(QWidget):
                     else:
                         buffer_data = padded_data
 
-                    buffer_data = gaussian_filter1d(buffer_data, sigma=0.8)
+                    buffer_data = gaussian_filter1d(buffer_data, sigma=self._SMOOTH_SIGMA)
 
                 if len(buffer_data) <= 0:
                     continue
 
                 if not getattr(self, "_display_ready_announced", False):
                     self._display_anchors = {}
-                    self._display_anchors_locked = set()
                     self._display_ready_announced = True
 
-                locked = getattr(self, "_display_anchors_locked", set())
-                if lead_name not in self._display_anchors:
-                    self._display_anchors[lead_name] = float(np.nanmedian(buffer_data))
-                    locked.add(lead_name)
-                    self._display_anchors_locked = locked
-
+                # Slowly-tracking baseline anchor, as the 12-lead test does. The
+                # anchor used to be measured once and locked forever, so any drift
+                # afterwards pushed the whole trace off centre; an exponential
+                # follower removes drift without a hard high-pass distorting the
+                # ST segment.
                 center_val = -2048.0 if lead_name == 'aVR' else 2048.0
                 if lead_is_off:
                     display_values = np.full(len(buffer_data), center_val)
                 else:
+                    baseline_now = float(np.nanmedian(buffer_data))
+                    if lead_name not in self._display_anchors:
+                        self._display_anchors[lead_name] = baseline_now
+                    else:
+                        alpha = self._BASELINE_ALPHA_SLOW
+                        self._display_anchors[lead_name] = (
+                            (1.0 - alpha) * self._display_anchors[lead_name] + alpha * baseline_now
+                        )
+
                     centered = (buffer_data - self._display_anchors[lead_name]) * gain_factor
+                    centered = centered - float(np.nanmean(centered))
+                    # Thin the trace to roughly two points per pixel column before
+                    # plotting. Seven lanes share this window, so each is only about
+                    # 900 px wide: at 500 Hz that is 3.3 points per column, and the
+                    # polyline zig-zags inside each column into a hairy-looking line.
+                    # The signal is already low-passed at 25 Hz, so halving the rate
+                    # is still five times Nyquist and cannot lose a peak — it is
+                    # thinner drawing, not less signal.
+                    centered = self._decimate_for_display(centered, self._DISPLAY_DECIMATION)
                     if lead_name == 'aVR':
                         display_values = np.clip(-2048.0 + centered, -4096, 0)
                     else:
                         display_values = np.clip(2048.0 + centered, 0, 4096)
+
+                # The curve is drawn with connect='finite', so a single NaN or inf
+                # anywhere in the window breaks the line and prints as a black dot
+                # inside the trace. The 12-lead test sanitises before plotting for
+                # exactly this reason; do the same, parking any bad sample on the
+                # lane's centre line instead of leaving a hole.
+                display_values = np.nan_to_num(
+                    np.asarray(display_values, dtype=float),
+                    nan=center_val, posinf=center_val, neginf=center_val,
+                )
 
                 # Scrolling window display (12-lead flow — no raster sweep)
                 x_axis = np.linspace(0.0, window_seconds, len(display_values))

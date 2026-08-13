@@ -220,8 +220,126 @@ class SignIn:
     def sign_in_user_allow_serial(self, identifier: str, secret: str) -> bool:
         return self.validate_credentials(identifier, secret)
 
+    def _remove_local_user(self, username: str) -> None:
+        """Delete local cached account + license token if backend confirms user is revoked/deleted."""
+        found = self._find_user_record(username)
+        if not found:
+            self._clear_license_files()
+            return
+        found_username, _ = found
+        if found_username in self.users:
+            del self.users[found_username]
+            self.save_users()
+            print(f"\U0001f5d1\ufe0f Removed local user cache for '{found_username}' (account revoked or deleted on backend).")
+        self._clear_license_files()
+
+    def _clear_license_files(self) -> None:
+        """Clear local license token (cardiox.lic) and stored license key on revocation."""
+        try:
+            import sys
+            sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+            from utils.license_manager import clear_stored_key, clear_license_cache
+            clear_stored_key()
+            clear_license_cache()
+            print("\U0001f5d1\ufe0f License token and stored key cleared from system (account revoked).")
+        except Exception as e:
+            print(f"\u26a0\ufe0f Could not clear license files: {e}")
+
+    def _check_license_server(self, username: str, password: str) -> str:
+        """
+        Query backend license server to validate credentials & license state.
+        Returns: 'ACTIVE', 'REVOKED', 'INVALID', or 'OFFLINE'
+        """
+        try:
+            import sys
+            sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+            from utils.license_manager import validate_with_credentials
+
+            # validate_with_credentials() sends the same password form
+            # register_device() used to create the seat (SHA-256), retrying with
+            # the raw password for seats created by older builds. Posting the raw
+            # password only made the server's bcrypt comparison fail and dropped
+            # every online login into the local fallback.
+            data = validate_with_credentials(username, password)
+        except Exception as net_err:
+            print(f"\u26a0\ufe0f License server offline or unreachable: {net_err}")
+            return "OFFLINE"
+
+        print(f"[License DEBUG] validate response: {str(data)[:300]}")
+
+        if data.get("offline"):
+            return "OFFLINE"
+
+        if data.get("success") is True or data.get("valid") is True or data.get("status") == "active":
+            return "ACTIVE"
+
+        err = str(data.get("error", "")).upper()
+        msg = str(data.get("message", "")).upper()
+        combined = f"{err} {msg}"
+
+        # Only an explicit revocation may purge the local account and licence.
+        # Seat-state answers (SEAT_INACTIVE / SEAT_RELEASED / seat not found)
+        # mean the cached token is stale, not that the user lost their licence \u2014
+        # deleting their account over one would lock out a paying customer whose
+        # only problem is an out-of-date token.
+        revoked_codes = [
+            "USER_DELETED", "ACCOUNT_REVOKED", "LICENSE_REVOKED",
+            "LICENSE EXPIRED", "LICENSE_EXPIRED", "REVOKED",
+        ]
+        if any(code in combined for code in revoked_codes):
+            return "REVOKED"
+
+        return "INVALID"
+
     def validate_credentials(self, username: str, password: str) -> bool:
-        """Validate signup password against full name, phone number, or username key."""
+        """
+        Online-first authentication with local JSON fallback.
+
+        Flow:
+          ACTIVE  -> server confirmed active -> allow & update timestamp
+          REVOKED -> server explicitly revoked/deleted -> purge local cache -> block
+          INVALID -> server returned 401 (bcrypt hash mismatch) -> fall back to local
+          OFFLINE -> server unreachable -> fall back to local + 7-day grace window
+        """
+        import time
+
+        server_status = self._check_license_server(username, password)
+
+        if server_status == "ACTIVE":
+            found = self._find_user_record(username)
+            if found:
+                found_username, record = found
+                record["last_server_validation"] = time.time()
+                self.users[found_username] = record
+                self.save_users()
+            return True
+
+        if server_status == "REVOKED":
+            self._remove_local_user(username)
+            return False
+
+        if server_status == "INVALID":
+            print(f"\u26a0\ufe0f Server returned INVALID for '{username}'. Falling back to local check.")
+            return self._validate_local_credentials(username, password)
+
+        if server_status == "OFFLINE":
+            found = self._find_user_record(username)
+            if not found:
+                return False
+            found_username, record = found
+            last_validated = record.get("last_server_validation", 0)
+            offline_grace_hours = 168.0  # 7 days
+            if last_validated > 0:
+                hours_since = (time.time() - last_validated) / 3600.0
+                if hours_since > offline_grace_hours:
+                    print(f"\u26a0\ufe0f Offline login rejected: {hours_since:.1f} hrs ago (limit: 168h / 7 days).")
+                    return False
+            return self._validate_local_credentials(username, password)
+
+        return False
+
+    def _validate_local_credentials(self, username: str, password: str) -> bool:
+        """Validate credentials locally against stored PBKDF2 hash in users.json."""
         found = self._find_user_record(username)
         if not found:
             return False
@@ -268,6 +386,15 @@ class SignIn:
 
         from datetime import datetime
         login_id = str(phone or username).strip()
+
+        # NOTE: this method saves the LOCAL account only. It must never POST to
+        # /register \u2014 the seat is created once by license_manager.register_device()
+        # (main.py's RegisterWorker), and that call's token is the one written to
+        # cardiox.lic. A second /register for the same fingerprint makes the server
+        # issue a new seat and deactivate the first, so the token on disk points at
+        # a dead seat and every later heartbeat answers SEAT_INACTIVE \u2014 which the
+        # login gate reported as "device seat was not found" and offered to fix by
+        # re-registering, creating another seat and repeating the loop.
         record: Dict[str, Any] = {
             "password": self._hash_password(password),
             "full_name": full_name or "",
@@ -279,7 +406,7 @@ class SignIn:
             "username": login_id,
             "serial_id": serial_id or "",
             "email": email or "",
-            "signup_date": datetime.now().strftime("%Y-%m-%d"),  # Store signup date for new users
+            "signup_date": datetime.now().strftime("%Y-%m-%d"),
         }
         login_aliases = []
         if full_name:
@@ -292,7 +419,6 @@ class SignIn:
         if login_aliases:
             record["login_aliases"] = login_aliases
         if isinstance(extra, dict):
-            # Only include simple JSON-serializable values
             for k, v in extra.items():
                 if k not in record:
                     record[k] = v

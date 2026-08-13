@@ -52,6 +52,8 @@ from collections import deque
 from scipy.signal import butter, lfilter, lfilter_zi, iirnotch, medfilt
 from scipy.ndimage import uniform_filter1d
 
+from .lead_off_detection import detect_lead_off
+
 try:
     from PyQt5.QtCore import QTimer, Qt
     from PyQt5.QtGui import QColor, QPen
@@ -306,25 +308,20 @@ class SmoothLeadBuffer:
         return self.display_samples - 1
 
     def _detect_lead_off(self) -> bool:
-        """Fast lead-off detection on 1-second window."""
+        """
+        Lead-off detection on the recent window.
+
+        Delegates to the shared detector rather than keeping private thresholds.
+        This used to carry its own copy — amplitude > 3500, variance > 300000,
+        and an ADC-rail test on absolute values — all of which fire on healthy
+        signal: clean windows on this hardware reach 3444 ADC p-p and a variance
+        of 360,460, and derived leads such as aVR are negative throughout, so the
+        rail test marked them off for an entire recording.
+        """
         if len(self._check_window) < 50:
             return False
-        w = np.array(self._check_window)
-        amplitude = float(np.ptp(w))        # Peak-to-peak
-        variance = float(np.var(w))
-
-        if amplitude < 20:                   # < ~0.1 mV → flatline
-            return True
-        if amplitude > 3500:                 # Saturation
-            return True
-        if variance < 4:                     # True flatline
-            return True
-        if variance > 300000:                # Pure noise (lead fully off)
-            return True
-        min_v, max_v = float(np.min(w)), float(np.max(w))
-        if min_v <= 5 or max_v >= 4090:     # ADC rail
-            return True
-        return False
+        w = np.asarray(self._check_window, dtype=float)
+        return bool(detect_lead_off(w, sampling_rate=500.0, window_size=len(w) / 500.0))
 
     def reset(self):
         """Reset buffer (call on reconnect or settings change)."""

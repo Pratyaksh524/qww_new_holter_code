@@ -9,69 +9,108 @@ Calibrated for 12-bit ADC (0-4096) at 500 Hz sampling rate.
 import numpy as np
 from typing import Dict
 
-# Calibrated thresholds for 12-bit ADC (0-4096) at 500 Hz
+# Thresholds calibrated against 857 one-second windows taken from clean 12-lead
+# captures on this hardware. The worst clean window measured 3444 ADC p-p and a
+# variance of 360,460, so anything at or below those figures is normal ECG and
+# must not be reported as a disconnected lead.
 LEAD_OFF_THRESHOLDS = {
-    'amplitude_min': 20,      # < 0.1 mV p-p → flatline/disconnected
-    'amplitude_max': 3000,    # > 14.6 mV p-p → saturation
-    'variance_min':  4,       # < variance → flatline (disconnected)
-    'variance_max':  250000,  # > variance → full noise (disconnected) - UPDATED from 10,000
-    'saturation_lo': 10,      # ADC < 10 → rail low
-    'saturation_hi': 4085,    # ADC > 4085 → rail high
+    'amplitude_min': 20,        # < 0.1 mV p-p over the window → flatline
+    'variance_min':  4,         # near-zero variance → flatline
+    'variance_max':  4000000,   # std ≈ 2000 ADC — half of full scale, unmistakable noise
+    'pinned_fraction': 0.15,    # ≥15% of the window held at one value → pinned/clipped
+    'pinned_tolerance': 1.0,    # ADC counts two samples may differ and still count as held
 }
+
+
+def _longest_held_run(window: np.ndarray, tolerance: float):
+    """
+    Longest run of samples that do not move by more than `tolerance`.
+
+    Returns (length, value_held). The value matters: a clipped signal is held at
+    the extreme of its own range, whereas a resting isoelectric segment is held
+    somewhere in the middle — only the former is evidence of a lead problem.
+    """
+    if window.size < 2:
+        return int(window.size), float(window[0]) if window.size else 0.0
+    moved = np.flatnonzero(np.abs(np.diff(window)) > tolerance)
+    if moved.size == 0:
+        return int(window.size), float(np.median(window))
+    boundaries = np.concatenate(([-1], moved, [window.size - 1]))
+    lengths = np.diff(boundaries)
+    longest = int(lengths.argmax())
+    start = int(boundaries[longest]) + 1
+    stop = int(boundaries[longest + 1]) + 1
+    return int(lengths[longest]), float(np.median(window[start:stop]))
 
 
 def detect_lead_off(signal: np.ndarray, sampling_rate: float = 500, window_size: float = 1.0) -> bool:
     """
-    Detect if ECG lead is disconnected (lead-off condition)
-    
-    Algorithm:
-    1. Check signal amplitude (lead-off → very low or very high)
-    2. Check signal variance (lead-off → near zero or very high noise)
-    3. Check for saturation (ADC at min/max values)
-    
-    Lead-off indicators:
-    - Signal amplitude < 0.1 mV (too low)
-    - Signal amplitude > 14.6 mV (too high, saturation)
-    - Signal variance < 4 (flatline)
-    - Signal variance > 250,000 (excessive noise) - CRITICAL: Updated from 10,000
-    - ADC values stuck at 0 or 4095 (saturation)
-    
+    Detect if an ECG lead is disconnected (lead-off condition).
+
+    A disconnected lead shows one of three signatures:
+
+    1. Flatline — the trace stops moving (tiny peak-to-peak span and variance).
+    2. Pinned — the signal is held at one value for a sustained stretch, which is
+       what ADC clipping against a rail looks like.
+    3. Runaway noise — variance far beyond anything a heart produces.
+
+    Deliberately NOT used as evidence of lead-off:
+
+    * A large peak-to-peak span. Chest leads on this hardware routinely exceed
+      3000 ADC p-p within one second on a tall QRS; the old amplitude_max of 3000
+      flagged healthy V3/V4 as saturated.
+    * Any absolute low/high ADC value. III, aVR and aVF are derived leads and are
+      legitimately negative — aVR essentially always is — so the old
+      `min_val <= 10` rule marked them disconnected for the entire recording.
+
+    Both of those produced flatlined leads in the live view, and because the
+    caller substitutes a constant for a lead it believes is off, they also wrote
+    flat sections into recordings and printed reports.
+
     Args:
-        signal: ECG signal (ADC values 0-4096)
+        signal: ECG signal in ADC counts (raw leads unsigned, derived leads signed)
         sampling_rate: Sampling rate in Hz (default: 500)
         window_size: Window size in seconds (default: 1.0)
-    
+
     Returns:
-        bool: True if lead is disconnected, False if connected
+        bool: True if the lead looks disconnected, False if connected
     """
     window_samples = int(window_size * sampling_rate)
-    
+
     if len(signal) < window_samples:
         return False
-    
-    # Get recent window
-    window = signal[-window_samples:]
-    
-    # Check 1: Signal amplitude (peak-to-peak)
-    amplitude = np.ptp(window)
-    if amplitude < LEAD_OFF_THRESHOLDS['amplitude_min']:
-        return True  # Lead off - too low (flatline)
-    if amplitude > LEAD_OFF_THRESHOLDS['amplitude_max']:
-        return True  # Lead off - saturation
-    
-    # Check 2: Signal variance
-    variance = np.var(window)
+
+    window = np.asarray(signal[-window_samples:], dtype=float)
+    if window.size == 0 or not np.all(np.isfinite(window)):
+        return True  # missing or non-finite samples — nothing usable arriving
+
+    # Check 1: flatline — no meaningful movement at all
+    if np.ptp(window) < LEAD_OFF_THRESHOLDS['amplitude_min']:
+        return True
+    variance = float(np.var(window))
     if variance < LEAD_OFF_THRESHOLDS['variance_min']:
-        return True  # Lead off - flatline (near zero variance)
+        return True
+
+    # Check 2: runaway noise
     if variance > LEAD_OFF_THRESHOLDS['variance_max']:
-        return True  # Lead off - excessive noise (CRITICAL FIX: 250,000 threshold)
-    
-    # Check 3: Saturation (ADC at min/max values)
-    min_val = np.min(window)
-    max_val = np.max(window)
-    if min_val <= LEAD_OFF_THRESHOLDS['saturation_lo'] or max_val >= LEAD_OFF_THRESHOLDS['saturation_hi']:
-        return True  # Lead off - ADC saturation
-    
+        return True
+
+    # Check 3: pinned/clipped — held at one value for a sustained stretch, and
+    # that value is at the edge of the window's own range. Requiring the extreme
+    # is what separates clipping from a quiet isoelectric segment, which also
+    # stops moving but sits mid-range. Polarity-agnostic, so raw and derived
+    # leads are treated alike without banning any particular ADC value.
+    held, held_value = _longest_held_run(window, LEAD_OFF_THRESHOLDS['pinned_tolerance'])
+    if held >= LEAD_OFF_THRESHOLDS['pinned_fraction'] * window.size:
+        span = float(np.ptp(window))
+        edge_margin = max(LEAD_OFF_THRESHOLDS['pinned_tolerance'], 0.02 * span)
+        at_extreme = (
+            held_value <= float(np.min(window)) + edge_margin
+            or held_value >= float(np.max(window)) - edge_margin
+        )
+        if at_extreme:
+            return True
+
     return False  # Lead connected
 
 
