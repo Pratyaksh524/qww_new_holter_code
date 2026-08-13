@@ -878,6 +878,35 @@ class HyperkalemiaTestWindow(QWidget):
         
         self._critical_lead_popup_shown = True
 
+        # ── STOP ALL TIMERS & DATA CAPTURE IMMEDIATELY ──────────────────────
+        # Do this before showing the popup so nothing runs in the background
+        # while the user sees the warning dialog.
+        try:
+            self.capture_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.duration_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'metrics_timer'):
+                self.metrics_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_bpm_refresh_timer') and self._bpm_refresh_timer.isActive():
+                self._bpm_refresh_timer.stop()
+        except Exception:
+            pass
+        # Stop serial reader so no new data packets arrive
+        try:
+            if self.serial_reader:
+                self.serial_reader.running = False
+        except Exception:
+            pass
+        self.is_capturing = False
+
         popup_title = "Warning"
         popup_text = "ECG Electrode disconnected, please check electrode connection"
         
