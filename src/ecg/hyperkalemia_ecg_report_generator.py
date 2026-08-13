@@ -544,7 +544,7 @@ def capture_real_ecg_graphs_from_dashboard(dashboard_instance=None, ecg_test_pag
         from ecg.ecg_filters import apply_dft_filter, apply_emg_filter, apply_ac_filter
         dft_setting = "0.5"
         emg_setting = "25"
-        ac_setting = str(settings_manager.get_setting("filter_ac", "off")).strip()
+        ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
         filtered_ecg_data = {}
         for lead, signal in real_ecg_data.items():
             if signal is None or len(signal) == 0:
@@ -1772,7 +1772,7 @@ def generate_ecg_report(filename="ecg_report.pdf", data=None, lead_images=None, 
                     from ecg.ecg_filters import apply_dft_filter, apply_emg_filter, apply_ac_filter
                     dft_setting = "0.5"
                     emg_setting = "25"
-                    ac_setting = str(settings_manager.get_setting("filter_ac", "50")).strip()
+                    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
                     if dft_setting not in ("off", ""):
                         adc_data = apply_dft_filter(adc_data, float(computed_sampling_rate), dft_setting)
                     if emg_setting not in ("off", ""):
@@ -2203,7 +2203,7 @@ def generate_ecg_report(filename="ecg_report.pdf", data=None, lead_images=None, 
                     from ecg.ecg_filters import apply_dft_filter, apply_emg_filter, apply_ac_filter
                     dft_setting = "0.5"
                     emg_setting = "25"
-                    ac_setting = str(settings_manager.get_setting("filter_ac", "50")).strip()
+                    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
                     if dft_setting not in ("off", ""):
                         adc_data = apply_dft_filter(adc_data, float(computed_sampling_rate), dft_setting)
                     if emg_setting not in ("off", ""):
@@ -2478,7 +2478,7 @@ def generate_ecg_report(filename="ecg_report.pdf", data=None, lead_images=None, 
     # SECOND COLUMN - Filter Band (SAME LINE AS QTc - right column)
     emg_setting = "25"
     dft_setting = "0.5"
-    ac_setting = str(settings_manager.get_setting("filter_ac", "off")).strip()
+    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
     ac_frequency = f"{ac_setting}Hz" if ac_setting in ("50", "60") else "Off"
     if dft_setting not in ("off", "") and emg_setting not in ("off", ""):
         filter_band = f"{dft_setting}-{emg_setting}Hz"
@@ -3206,7 +3206,7 @@ def generate_hyperkalemia_ecg_report(filename="hyperkalemia_ecg_report.pdf", lea
     wave_gain_mm_mv = _safe_float(wave_gain_setting, 10.0)
     emg_setting = "25"
     dft_setting = "0.5"
-    ac_setting = str(settings_manager.get_setting("filter_ac", "off")).strip()
+    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
     ac_frequency = f"{ac_setting}Hz" if ac_setting in ("50", "60") else "Off"
     if dft_setting not in ("off", "") and emg_setting not in ("off", ""):
         filter_band = f"{dft_setting}-{emg_setting}Hz"
@@ -4142,7 +4142,7 @@ def generate_hyperkalemia_ecg_report(filename="hyperkalemia_ecg_report.pdf", lea
     # Filter Band and Speed/Gain (merged in one line)
     emg_setting = "25"
     dft_setting = "0.5"
-    ac_setting = str(settings_manager.get_setting("filter_ac", "off")).strip()
+    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
     ac_frequency = f"{ac_setting}Hz" if ac_setting in ("50", "60") else "Off"
     if dft_setting not in ("off", "") and emg_setting not in ("off", ""):
         filter_band = f"{dft_setting}-{emg_setting}Hz"

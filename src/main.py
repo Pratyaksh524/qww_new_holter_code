@@ -18,6 +18,18 @@ DEVELOPER NOTES & RECENT REFACTORS:
 
 import sys
 import os
+
+
+def _dev_autologin_enabled() -> bool:
+    """
+    True only when the developer auto-login bypass is explicitly switched on.
+
+    The bypass skips the password prompt AND the licence gate (heartbeat,
+    revocation, offline grace), so it defaults to OFF and is never enabled in a
+    distributed build — CARDIOX_DEV_AUTOLOGIN is stripped from the installer's
+    .env by build_exe.py.
+    """
+    return os.getenv("CARDIOX_DEV_AUTOLOGIN", "").strip().lower() in ("1", "true", "yes", "on")
 import shutil
 
 # Ensure the main src directory is at the absolute front of sys.path
@@ -1069,21 +1081,29 @@ class LoginRegisterDialog(QDialog):
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
     def exec_(self):
-        # Auto-login bypass with username 'cardiomac' / phone '9560350477'
-        try:
-            print("🔑 Bypassing login screen for user: cardiomac (9560350477)")
-            found = self.sign_in_logic._find_user_record("cardiomac")
-            if found:
-                username, record = found
-                self.result = True
-                self.username = username
-                self.user_details = record
-                return QDialog.Accepted
-            else:
-                print("⚠️ User 'cardiomac' not found in users.json! Showing login dialog...")
-        except Exception as e:
-            print(f"⚠️ Bypass login error: {e}")
-        
+        # Development-only auto-login for the 'cardiomac' test account.
+        #
+        # SAFETY: this returns QDialog.Accepted without any password check, which
+        # also skips the licence gate that runs in the login handler — heartbeat,
+        # revocation and offline-grace enforcement all live there. A revoked seat
+        # would reach the dashboard unchallenged. It must never be active in a
+        # distributed build, so it is gated on CARDIOX_DEV_AUTOLOGIN, which is
+        # stripped from the .env staged into the installer by build_exe.py.
+        if _dev_autologin_enabled():
+            try:
+                print("🔑 [DEV] Bypassing login screen for user: cardiomac (9560350477)")
+                found = self.sign_in_logic._find_user_record("cardiomac")
+                if found:
+                    username, record = found
+                    self.result = True
+                    self.username = username
+                    self.user_details = record
+                    return QDialog.Accepted
+                else:
+                    print("⚠️ User 'cardiomac' not found in users.json! Showing login dialog...")
+            except Exception as e:
+                print(f"⚠️ Bypass login error: {e}")
+
         # If not bypassed, initialize UI now before showing dialog
         if not getattr(self, "ui_initialized", False):
             self.init_ui()
@@ -1770,9 +1790,51 @@ class LoginRegisterDialog(QDialog):
             )
             return
 
+        # ── Start the credential check while the licence gate runs ────────────
+        # Both stages make a network round-trip and each takes ~4 s, so running
+        # them one after the other left the user staring at the login screen for
+        # ~8 s. They are independent — the licence check asks the server about
+        # this device, the credential check about this account — so the slower of
+        # the two now sets the wait instead of their sum. Users are reloaded first
+        # because validate_credentials() reads them on the worker thread.
+        import threading as _login_threading
+
+        try:
+            self.sign_in_logic.users = self.sign_in_logic.load_users()
+        except Exception:
+            pass
+
+        _cred_ok = [None]
+        _cred_done = _login_threading.Event()
+
+        def _run_credential_check():
+            try:
+                _cred_ok[0] = bool(
+                    self.sign_in_logic.validate_credentials(identifier, password_or_serial)
+                )
+            except Exception as _ce:
+                logger.warning(f"Credential check failed: {_ce}")
+                _cred_ok[0] = False
+            finally:
+                _cred_done.set()
+
+        _login_threading.Thread(
+            target=_run_credential_check, daemon=True, name="LoginCredentialCheck"
+        ).start()
+
         # Enforce license key check at login step
         try:
-            from utils.license_manager import load_stored_key, token_file_exists, load_token_file, run_startup_checks, clear_stored_key, clear_license_cache
+            from utils.license_manager import (
+                load_stored_key,
+                token_file_exists,
+                load_token_file,
+                run_startup_checks,
+                clear_stored_key,
+                clear_license_cache,
+                is_stale_seat_error,
+                resync_token_from_credentials,
+                OFFLINE_WARNING_DAYS,
+            )
             stored_key = load_stored_key()
             if not stored_key and not token_file_exists():
                 QMessageBox.warning(
@@ -1782,19 +1844,47 @@ class LoginRegisterDialog(QDialog):
                 )
                 return
 
-            # Fast local token check first — avoids blocking GUI thread with network HTTP heartbeat
-            token = load_token_file()
-            if token is None:
-                result = run_startup_checks(force_heartbeat=False)
-                if not result.ok:
-                    logger.warning(f"Login blocked due to license failure: {result.reason}")
-                    is_explicit_revocation = (
-                        result.step_failed == 5
-                        and getattr(result, "error_code", "") == "LICENSE_REVOKED"
-                    )
+            # Always run the server check. A local token file only proves this
+            # machine was activated at some point — it says nothing about the
+            # current server-side state, so short-circuiting on it would let
+            # revoked seats log in offline-style. Revocation is only detected by
+            # the Check-5 heartbeat inside run_startup_checks().
+            result = run_startup_checks(force_heartbeat=False)
 
+            # ── Stale seat: repair the cached token instead of the licence ────
+            # The server moves a device onto a new seat whenever it registers
+            # again and deactivates the old one, so cardiox.lic can point at a
+            # dead seat while the licence is perfectly healthy. The user is
+            # standing right here with valid credentials, so fetch the current
+            # token for this device and re-run the check — silently, because
+            # nothing is wrong from their side.
+            if (
+                not result.ok
+                and result.step_failed == 5
+                and not getattr(result, "offline_mode", False)
+                and is_stale_seat_error(getattr(result, "error_code", ""), result.reason)
+            ):
+                logger.info(
+                    f"Login: stale seat reported ({result.error_code}); "
+                    "re-syncing licence token from server."
+                )
+                if resync_token_from_credentials(identifier, password_or_serial):
+                    result = run_startup_checks(force_heartbeat=False)
+                    stored_key = load_stored_key() or stored_key
+
+            if not result.ok:
+                logger.warning(f"Login blocked due to license failure: {result.reason}")
+                is_explicit_revocation = (
+                    result.step_failed == 5
+                    and getattr(result, "error_code", "") == "LICENSE_REVOKED"
+                )
 
                 # ── Seat-missing: offer re-registration ───────────────────────
+                # Only for a seat the server genuinely does not have. The generic
+                # LICENSE_BLOCKED fallback is NOT included: it is what
+                # run_startup_checks assigns to any refusal it cannot name, and
+                # treating it as a missing seat offered to wipe healthy licences
+                # over transient server errors.
                 reason_lower = result.reason.lower()
                 error_code_upper = getattr(result, "error_code", "").upper()
                 _seat_missing_phrases = (
@@ -1808,7 +1898,7 @@ class LoginRegisterDialog(QDialog):
                     result.step_failed == 5
                     and not is_explicit_revocation
                     and (
-                        error_code_upper in ("SEAT_NOT_FOUND", "LICENSE_BLOCKED")
+                        error_code_upper == "SEAT_NOT_FOUND"
                         or any(p in reason_lower for p in _seat_missing_phrases)
                     )
                 )
@@ -1837,6 +1927,22 @@ class LoginRegisterDialog(QDialog):
                         except Exception:
                             pass
                     return
+                elif is_stale_seat_error(error_code_upper, result.reason):
+                    # The re-sync above could not reach or match this device's
+                    # current seat. Nothing here is the user's licence being
+                    # invalid, so nothing is wiped — tell them what actually
+                    # helps instead of sending them back through Sign Up.
+                    QMessageBox.critical(
+                        self,
+                        "License Verification Required",
+                        "This device's licence record is out of date and could not "
+                        "be refreshed automatically.\n\n"
+                        "Check your internet connection and sign in with the phone "
+                        "number you used at signup.\n\n"
+                        "If this keeps happening, contact Deckmount support and quote "
+                        f"license key {stored_key}.",
+                    )
+                    return
                 else:
                     QMessageBox.critical(
                         self,
@@ -1846,22 +1952,82 @@ class LoginRegisterDialog(QDialog):
                             3: "Fingerprint Mismatch",
                             4: "RhythmUltra Device Required",
                             5: "License Verification Required",
-                        }.get(result.step_failed, "License Blocked"),
-                        result.reason,
+                        }.get(result.step_failed, "License Blocked") if not is_explicit_revocation else "License Revoked",
+                        # result.reason is REVOKED_MESSAGE for revocation, which
+                        # already tells the user to contact Deckmount support.
+                        result.reason
+                        + ("\n\nAll license details have been removed from this device."
+                           if is_explicit_revocation else ""),
                     )
                     if result.step_failed in {1, 2} or is_explicit_revocation:
-                        clear_stored_key()
-                        clear_license_cache()
+                        # Wipe every license credential on the device: key file,
+                        # legacy cache, sidecar metadata and the signed token.
+                        #
+                        # Guarded on its own: this block is housekeeping AFTER the
+                        # decision to deny has already been made, so nothing in here
+                        # may be allowed to propagate out and skip the `return` below.
+                        # A revoked seat once reached the dashboard exactly that way —
+                        # ECGLogger.info() takes a single pre-formatted message, and
+                        # passing %s-style arguments raised TypeError, which the outer
+                        # handler swallowed before falling through into normal login.
+                        blocked_because = (
+                            "revoked" if is_explicit_revocation
+                            else f"step {result.step_failed}"
+                        )
+                        try:
+                            clear_stored_key()
+                            clear_license_cache()
+                            logger.info(
+                                f"Login blocked ({blocked_because}): cleared all license "
+                                "credentials; redirecting to Sign Up tab."
+                            )
+                        except Exception as wipe_err:
+                            logger.warning(
+                                f"License credential wipe reported an error: {wipe_err}"
+                            )
+                        # Send the user to Sign Up (index 1) so they can register
+                        # again — without a license they cannot get past this gate.
+                        try:
+                            self.stacked.setCurrentIndex(1)
+                        except Exception:
+                            pass
                     return
+            # Licence is valid. If we are running on the offline grace window and it
+            # is nearly exhausted, warn on every launch for the final
+            # OFFLINE_WARNING_DAYS days. The server heartbeat is mandatory — it is what
+            # stops a one-time signup being used indefinitely offline — so the cutoff
+            # must never arrive as a surprise.
+            if (
+                getattr(result, "offline_mode", False)
+                and result.days_remaining is not None
+                and result.days_remaining <= OFFLINE_WARNING_DAYS
+            ):
+                logger.warning(
+                    f"Offline grace nearly exhausted: {result.days_remaining} day(s) left."
+                )
+                QMessageBox.warning(self, "Internet Connection Required", result.reason)
+
         except Exception as le:
+            # FAIL CLOSED. Every deny path inside the try above returns on its own,
+            # so the only way execution legitimately reaches past it is a license
+            # that passed all five checks. Reaching here means the licence gate
+            # itself malfunctioned, and continuing would hand out access without a
+            # verified licence — which is how a revoked seat previously logged in.
             logger.warning(f"Failed to check license during login: {le}")
-        # Users can be created while the app is running (e.g., by Doctor/HCP head flows).
-        # Refresh from disk before validating so new accounts can log in immediately.
-        try:
-            self.sign_in_logic.users = self.sign_in_logic.load_users()
-        except Exception:
-            pass
-        if self.sign_in_logic.validate_credentials(identifier, password_or_serial):
+            QMessageBox.critical(
+                self,
+                "License Verification Failed",
+                "The license on this device could not be verified.\n\n"
+                "Please restart the application. If the problem persists, "
+                "contact Deckmount support.",
+            )
+            return
+        # Collect the credential check started before the licence gate. It has had
+        # the whole licence round-trip to finish, so this normally returns at once.
+        # The generous timeout is a backstop for a stalled socket; on expiry the
+        # result is None and login is denied rather than granted.
+        _cred_done.wait(timeout=20.0)
+        if _cred_ok[0]:
             found = self.sign_in_logic._find_user_record(identifier)
             if found:
                 username, record = found
@@ -2665,7 +2831,13 @@ def main():
 
         # ── Startup License Verification Enforcer ──
         try:
-            from utils.license_manager import run_startup_checks, load_stored_key, clear_stored_key, clear_license_cache
+            from utils.license_manager import (
+                run_startup_checks,
+                load_stored_key,
+                clear_stored_key,
+                clear_license_cache,
+                is_stale_seat_error,
+            )
 
             stored_key = load_stored_key()
             if stored_key:
@@ -2707,10 +2879,32 @@ def main():
                         and getattr(result, "error_code", "") == "LICENSE_REVOKED"
                     )
 
+                    # ── Stale token: let the login screen repair it ───────────
+                    # A superseded seat (SEAT_INACTIVE and friends) means only
+                    # that cardiox.lic is out of date. No credentials exist yet
+                    # at startup, so say nothing and open the login screen —
+                    # handle_login() re-syncs the token once the user signs in.
+                    if (
+                        result.step_failed == 5
+                        and not is_explicit_revocation
+                        and is_stale_seat_error(
+                            getattr(result, "error_code", ""), result.reason
+                        )
+                    ):
+                        logger.info(
+                            f"Startup: stale seat reported ({result.error_code}); "
+                            "deferring to login for token re-sync."
+                        )
+                        result = None
+
+                if result is not None and not result.ok:
                     # ── Detect "Seat not found" / seat-missing errors ─────────
                     # This happens when the server DB was reset or the seat was
                     # deleted server-side.  The fix is to clear the stale local
-                    # token and let the user re-register.
+                    # token and let the user re-register. LICENSE_BLOCKED — the
+                    # catch-all run_startup_checks assigns to refusals it cannot
+                    # name — is deliberately excluded, so a transient server
+                    # error can no longer offer to wipe a healthy licence.
                     reason_lower = result.reason.lower()
                     error_code_upper = getattr(result, "error_code", "").upper()
                     _seat_missing_phrases = (
@@ -2724,7 +2918,7 @@ def main():
                         result.step_failed == 5
                         and not is_explicit_revocation
                         and (
-                            error_code_upper in ("SEAT_NOT_FOUND", "LICENSE_BLOCKED")
+                            error_code_upper == "SEAT_NOT_FOUND"
                             or any(p in reason_lower for p in _seat_missing_phrases)
                         )
                     )
