@@ -189,6 +189,47 @@ tamper detection requires moving to RS256 and shipping only the public key.
 
 ## 📋 Changelog
 
+### 🔧 [2026-08-13] — Licence Re-Sync, Doctor-Review Upload, Lead-Off Detection, Report Strips & Live Display
+
+#### ✅ Login loop after signup (`src/auth/sign_in.py`, `src/main.py`, `src/utils/license_manager.py`)
+- **Double registration removed:** signup called `/register` twice — once via `license_manager.register_device()` (whose token is saved to `cardiox.lic`) and again from `register_user_with_details()`. The server moved the machine onto a new seat and deactivated the first, so every later heartbeat answered `SEAT_INACTIVE`.
+- **Error code parsing:** `run_startup_checks()` read only `error_code`, but the licence Lambdas put the code in `error`. Every refusal collapsed into the `LICENSE_BLOCKED` fallback, which the login gate reported as *"Your device seat was not found"* and offered to fix by wiping the licence — creating another seat and repeating the failure on the next login.
+- **Silent repair:** added `is_stale_seat_error()` and `resync_token_from_credentials()`. A stale token is refreshed from `/validate` using the credentials just entered and the checks re-run, with no dialog. Startup defers to the login screen instead of prompting.
+- **Credential form:** `validate_with_credentials()` sends the SHA-256 form that `register_device()` used, retries the raw password for seats created by older builds, and falls back to the registered phone when the typed identifier resolves an old seat.
+- **`SEAT_INACTIVE` is no longer treated as revocation** in `sign_in`, which previously deleted the local account and wiped the licence over an out-of-date token.
+
+#### ✅ Doctor-review upload — HTTP 404 "Old Report not supported" (`src/utils/cloud_uploader.py`)
+- S3 keys were built from upload-time state: `datetime.now()` for the date segment and the *currently connected* RhythmUltra for the device folder, falling back to `0000`. A report recorded on the 10th but uploaded on the 12th was filed where the review Lambda never looks, and each retry repeated the mistake — one report appeared six times under the wrong prefix.
+- `_report_identity()` / `_report_location()` now derive both the device and the date from the report's own filename (`<DEVICE>_<YYYYMMDD>_<HHMMSS>`), covering all three filename formats the backend accepts, and `send_for_doctor_review()` takes its `deviceId` from the same resolver so the upload and the assignment cannot disagree.
+
+#### ✅ Lead-off false positives (`src/ecg/lead_off_detection.py`, `src/ecg/smooth_display.py`, `src/ecg/hyperkalemia_test.py`)
+- Thresholds fired on healthy signal. Across 857 clean one-second windows from this hardware, leads reach 3444 ADC p-p and a variance of 360,460 — above the old `amplitude_max` 3000 and `variance_max` 250,000 — and the absolute `min <= 10` rule marked the derived leads (III, aVR, aVF) disconnected for entire recordings, aVR permanently. Because a lead-off verdict substitutes a constant in the display, the analysis buffer **and** the recording, this printed flat strips into reports.
+- Rewritten around three real signatures: flatline, sustained pinning at the signal's own extreme, and runaway variance. **0 false positives** on all 857 clean windows, with flat, dithered-flat, rail-clipped and runaway-noise signals still detected.
+- `smooth_display.py` carried a private copy of the same broken thresholds; it now delegates to the shared detector.
+- The hyperkalemia window latches a verdict only after **0.5 s** of continuous agreement and releases after 0.2 s, so a motion artifact can no longer blank a lead.
+
+#### ✅ Report waveform strips (`src/ecg/ecg_report_generator.py`, `src/ecg/6_2_ecg_report_generator.py`, `src/ecg/ecg_report_android.py`)
+- **Edge tapers removed.** `stabilize_report_edges()` cross-faded the first and last 140–180 ms into a flat baseline; a beat 60 ms from the strip end printed at **14 %** of its true height. Filter transients are already prevented upstream by 0.5 s of real pre-roll plus reflect padding.
+- **6×2 strips were also being cut.** Two noise-triggered trims and an unconditional 3 %-per-side "hard trim" discarded up to **16 %** of the recorded strip even on clean traces, and the drawing code faded both ends. All removed — 5000 samples in now means 5000 out.
+- HRV and hyperkalemia report strips were already free of tapers and needed no change.
+
+#### ✅ Live display (`src/ecg/hyperkalemia_test.py`, `src/ecg/hrv_test.py`)
+- **Scrolling instead of raster sweep.** The HRV window's CRT-style eraser bar (80 samples plus a 14 px black pen) blanked part of the trace as it swept; the trace now scrolls with the newest sample pinned to the right edge.
+- **Downsampling mode.** Both windows used `auto=True, mode='peak'`, which collapses each pixel column into a min/max pair and draws the trace as vertical bars — the background showed between them as black speckle in the line. Both now use the 12-lead's `ds=1, auto=False, mode='subsample'`.
+- **Point density.** Hyperkalemia lanes are ~900 px wide, so plotting 6000 points meant 6.7 per pixel column and a hairy line. Now decimated 2× to 1.7 per column, matching the 12-lead. The signal is low-passed at 25 Hz, so an effective 250 Hz is ten times Nyquist — R-wave amplitude is preserved exactly.
+- **Non-finite guard.** Both curves draw with `connect='finite'`, so a single NaN breaks the line. Hyperkalemia sanitises before `setData`; HRV holds the last good value rather than writing NaN into the sweep buffer, where `np.clip` leaves it as NaN and the step guard cannot catch it.
+- **Baseline follower.** The hyperkalemia display anchor was measured once and locked forever, so drift pushed the trace off centre. It now uses the 12-lead's slow exponential follower (α = 0.0005) plus DC removal.
+- **Filters.** AC 50 Hz / EMG 25 Hz / baseline 0.5 Hz are fixed for HRV and hyperkalemia on screen and in their reports; only the 12-lead follows the settings screen. The AC filter previously came from settings in ten places across the two report generators, half of them defaulting to `off` — so a report could print with no mains notch at all.
+- **Trace style:** `#00FF00` at 2.0 px in both windows, matching the green the holter modules already use.
+
+#### ✅ Performance — 8 GB / i3 minimum spec (`src/ecg/hyperkalemia_test.py`, `src/main.py`, `src/utils/license_manager.py`)
+- **Buffer writes:** the capture loop called `np.roll` per sample per lead, copying a 10,000-element buffer 500 times a second for each of 7 leads, plus a Lead II buffer that is never read during capture — about 40 million element moves per second. Replaced with index-addressed rings: **74.8 ms → 1.9 ms** per second of capture (40× cheaper), roughly 18 % of a core returned on a minimum-spec machine.
+- **Antialiasing** is switched off under `is_low_spec_mode()` (≤8 GB RAM or ≤4 threads), where it roughly triples line-drawing cost.
+- **Login wait halved:** the licence heartbeat (~3.8 s) and the credential check (~3.8 s) ran sequentially on the UI thread. They are independent, so they now run concurrently — measured **8.48 s → 4.50 s**. The gate still fails closed if the worker stalls. The credential check also stops retrying the same identifier with the other password form after a seat-state answer, which cannot change the outcome.
+
+#### ✅ UI
+- Removed the **Ctrl + E** row from the History window shortcuts sheet (`src/dashboard/history_window.py`); the binding had already been removed with the email button, so the sheet advertised a shortcut that did nothing.
+
 ### 🔧 [2026-08-03] — Security, Report Formatting, 12-Lead Freeze/Resume & Dashboard Fixes
 
 #### ✅ Security Hardening & Loophole Audit

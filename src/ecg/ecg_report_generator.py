@@ -836,11 +836,13 @@ def create_report_strip_paths(
         trend = np.polyval(np.polyfit(x_idx, centered_adc, 1), x_idx)
         centered_adc = centered_adc - trend
 
-    try:
-        from ecg.ecg_filters import stabilize_report_edges
-        centered_adc = stabilize_report_edges(centered_adc, float(fs), edge_ms=140.0)
-    except Exception:
-        pass
+    # NOTE: no edge taper here. stabilize_report_edges() cross-fades the first and
+    # last samples into a flat baseline, which flattens any QRS that happens to fall
+    # in that window — a beat 60 ms from the strip end printed at ~15% of its real
+    # height. Filter transients are already handled without touching real samples:
+    # _prepare_report_strip_signal() prepends 0.5 s of genuine pre-roll and
+    # reflect-pads around the filters before trimming back to the visible window.
+    # The strip must print the recorded waveform to its last sample.
 
     grid_box_mm = 5.0
     box_height_points = grid_box_mm * mm_unit
@@ -915,7 +917,7 @@ def apply_report_ecg_filters(signal, sampling_rate, settings_manager):
 
     try:
         # Post-process: ensure a stable edge and robust notch removal for reports
-        from ecg.ecg_filters import notch_filter_butterworth, stabilize_report_edges
+        from ecg.ecg_filters import notch_filter_butterworth
 
         # Always apply a gentle Butterworth notch at configured AC frequency (default 50Hz)
         try:
@@ -934,11 +936,10 @@ def apply_report_ecg_filters(signal, sampling_rate, settings_manager):
             except Exception:
                 pass
 
-        # Stabilize edges to remove terminal transients at the entering/ending edges
-        try:
-            work = stabilize_report_edges(work, float(sampling_rate), edge_ms=180.0)
-        except Exception:
-            pass
+        # No edge taper — the strip keeps its recorded amplitude right to the last
+        # sample. Transients are prevented upstream by real pre-roll plus reflect
+        # padding in _prepare_report_strip_signal(), so fading the ends only
+        # destroyed genuine beats near the strip boundary.
     except Exception:
         pass
 

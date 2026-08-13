@@ -523,7 +523,7 @@ def capture_real_ecg_graphs_from_dashboard(dashboard_instance=None, ecg_test_pag
         from ecg.ecg_filters import apply_dft_filter, apply_emg_filter, apply_ac_filter
         dft_setting = "0.5"
         emg_setting = "25"
-        ac_setting = str(settings_manager.get_setting("filter_ac", "off")).strip()
+        ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
         filtered_ecg_data = {}
         for lead, signal in real_ecg_data.items():
             if signal is None or len(signal) == 0:
@@ -1831,7 +1831,7 @@ def generate_ecg_report(filename="ecg_report.pdf", data=None, lead_images=None, 
                     from ecg.ecg_filters import apply_dft_filter, apply_emg_filter, apply_ac_filter
                     dft_setting = "0.5"
                     emg_setting = "25"
-                    ac_setting = str(settings_manager.get_setting("filter_ac", "50")).strip()
+                    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
                     if dft_setting not in ("off", ""):
                         adc_data = apply_dft_filter(adc_data, float(computed_sampling_rate), dft_setting)
                     if emg_setting not in ("off", ""):
@@ -2424,7 +2424,7 @@ def generate_ecg_report(filename="ecg_report.pdf", data=None, lead_images=None, 
     # SECOND COLUMN - Speed/Gain (merged in one line) (ABOVE ECG GRAPH - shifted further up)
     emg_setting = "25"
     dft_setting = "0.5"
-    ac_setting = str(settings_manager.get_setting("filter_ac", "off")).strip()
+    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
     ac_frequency = f"{ac_setting}Hz" if ac_setting in ("50", "60") else "Off"
     if dft_setting not in ("off", "") and emg_setting not in ("off", ""):
         filter_band = f"{dft_setting}-{emg_setting}Hz"
@@ -3097,7 +3097,7 @@ def generate_hrv_ecg_report(filename="hrv_ecg_report.pdf", captured_data=None, d
     wave_gain_mm_mv = _safe_float(wave_gain_setting, 10.0)
     emg_setting = "25"
     dft_setting = "0.5"
-    ac_setting = str(settings_manager.get_setting("filter_ac", "off")).strip()
+    ac_setting = "50"  # fixed for this test: AC 50 Hz on display and report, not taken from settings (only the 12-lead test is user-configurable)
     ac_frequency = f"{ac_setting}Hz" if ac_setting in ("50", "60") else "Off"
     if dft_setting not in ("off", "") and emg_setting not in ("off", ""):
         filter_band = f"{dft_setting}-{emg_setting}Hz"
@@ -3531,9 +3531,10 @@ def generate_hrv_ecg_report(filename="hrv_ecg_report.pdf", captured_data=None, d
             centered_adc = centered_adc - float(np.mean(centered_adc))
         # Skip linear detrending if the robust median-mean baseline filter (0.5 Hz) was applied,
         # because linear fitting on short asymmetric ECG segments can introduce artificial slants/drift.
-        dft_val_clean = str(settings_manager.get_setting("filter_dft", "0.5")).strip() if settings_manager else "0.5"
-        if dft_val_clean in ("off", ""):
-            dft_val_clean = "0.5"
+        # Fixed 0.5 Hz baseline filter for this test, so the branch below (linear
+        # detrend) never applies. Kept explicit rather than read from settings —
+        # only the 12-lead test follows the settings screen.
+        dft_val_clean = "0.5"
         if dft_val_clean != "0.5" and centered_adc.size > 20:
             x_idx = np.arange(centered_adc.size, dtype=float)
             trend = np.polyval(np.polyfit(x_idx, centered_adc, 1), x_idx)

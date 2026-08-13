@@ -1790,9 +1790,51 @@ class LoginRegisterDialog(QDialog):
             )
             return
 
+        # ── Start the credential check while the licence gate runs ────────────
+        # Both stages make a network round-trip and each takes ~4 s, so running
+        # them one after the other left the user staring at the login screen for
+        # ~8 s. They are independent — the licence check asks the server about
+        # this device, the credential check about this account — so the slower of
+        # the two now sets the wait instead of their sum. Users are reloaded first
+        # because validate_credentials() reads them on the worker thread.
+        import threading as _login_threading
+
+        try:
+            self.sign_in_logic.users = self.sign_in_logic.load_users()
+        except Exception:
+            pass
+
+        _cred_ok = [None]
+        _cred_done = _login_threading.Event()
+
+        def _run_credential_check():
+            try:
+                _cred_ok[0] = bool(
+                    self.sign_in_logic.validate_credentials(identifier, password_or_serial)
+                )
+            except Exception as _ce:
+                logger.warning(f"Credential check failed: {_ce}")
+                _cred_ok[0] = False
+            finally:
+                _cred_done.set()
+
+        _login_threading.Thread(
+            target=_run_credential_check, daemon=True, name="LoginCredentialCheck"
+        ).start()
+
         # Enforce license key check at login step
         try:
-            from utils.license_manager import load_stored_key, token_file_exists, load_token_file, run_startup_checks, clear_stored_key, clear_license_cache, OFFLINE_WARNING_DAYS
+            from utils.license_manager import (
+                load_stored_key,
+                token_file_exists,
+                load_token_file,
+                run_startup_checks,
+                clear_stored_key,
+                clear_license_cache,
+                is_stale_seat_error,
+                resync_token_from_credentials,
+                OFFLINE_WARNING_DAYS,
+            )
             stored_key = load_stored_key()
             if not stored_key and not token_file_exists():
                 QMessageBox.warning(
@@ -1808,6 +1850,28 @@ class LoginRegisterDialog(QDialog):
             # revoked seats log in offline-style. Revocation is only detected by
             # the Check-5 heartbeat inside run_startup_checks().
             result = run_startup_checks(force_heartbeat=False)
+
+            # ── Stale seat: repair the cached token instead of the licence ────
+            # The server moves a device onto a new seat whenever it registers
+            # again and deactivates the old one, so cardiox.lic can point at a
+            # dead seat while the licence is perfectly healthy. The user is
+            # standing right here with valid credentials, so fetch the current
+            # token for this device and re-run the check — silently, because
+            # nothing is wrong from their side.
+            if (
+                not result.ok
+                and result.step_failed == 5
+                and not getattr(result, "offline_mode", False)
+                and is_stale_seat_error(getattr(result, "error_code", ""), result.reason)
+            ):
+                logger.info(
+                    f"Login: stale seat reported ({result.error_code}); "
+                    "re-syncing licence token from server."
+                )
+                if resync_token_from_credentials(identifier, password_or_serial):
+                    result = run_startup_checks(force_heartbeat=False)
+                    stored_key = load_stored_key() or stored_key
+
             if not result.ok:
                 logger.warning(f"Login blocked due to license failure: {result.reason}")
                 is_explicit_revocation = (
@@ -1816,6 +1880,11 @@ class LoginRegisterDialog(QDialog):
                 )
 
                 # ── Seat-missing: offer re-registration ───────────────────────
+                # Only for a seat the server genuinely does not have. The generic
+                # LICENSE_BLOCKED fallback is NOT included: it is what
+                # run_startup_checks assigns to any refusal it cannot name, and
+                # treating it as a missing seat offered to wipe healthy licences
+                # over transient server errors.
                 reason_lower = result.reason.lower()
                 error_code_upper = getattr(result, "error_code", "").upper()
                 _seat_missing_phrases = (
@@ -1829,7 +1898,7 @@ class LoginRegisterDialog(QDialog):
                     result.step_failed == 5
                     and not is_explicit_revocation
                     and (
-                        error_code_upper in ("SEAT_NOT_FOUND", "LICENSE_BLOCKED")
+                        error_code_upper == "SEAT_NOT_FOUND"
                         or any(p in reason_lower for p in _seat_missing_phrases)
                     )
                 )
@@ -1857,6 +1926,22 @@ class LoginRegisterDialog(QDialog):
                             self.stacked.setCurrentIndex(1)
                         except Exception:
                             pass
+                    return
+                elif is_stale_seat_error(error_code_upper, result.reason):
+                    # The re-sync above could not reach or match this device's
+                    # current seat. Nothing here is the user's licence being
+                    # invalid, so nothing is wiped — tell them what actually
+                    # helps instead of sending them back through Sign Up.
+                    QMessageBox.critical(
+                        self,
+                        "License Verification Required",
+                        "This device's licence record is out of date and could not "
+                        "be refreshed automatically.\n\n"
+                        "Check your internet connection and sign in with the phone "
+                        "number you used at signup.\n\n"
+                        "If this keeps happening, contact Deckmount support and quote "
+                        f"license key {stored_key}.",
+                    )
                     return
                 else:
                     QMessageBox.critical(
@@ -1937,13 +2022,12 @@ class LoginRegisterDialog(QDialog):
                 "contact Deckmount support.",
             )
             return
-        # Users can be created while the app is running (e.g., by Doctor/HCP head flows).
-        # Refresh from disk before validating so new accounts can log in immediately.
-        try:
-            self.sign_in_logic.users = self.sign_in_logic.load_users()
-        except Exception:
-            pass
-        if self.sign_in_logic.validate_credentials(identifier, password_or_serial):
+        # Collect the credential check started before the licence gate. It has had
+        # the whole licence round-trip to finish, so this normally returns at once.
+        # The generous timeout is a backstop for a stalled socket; on expiry the
+        # result is None and login is denied rather than granted.
+        _cred_done.wait(timeout=20.0)
+        if _cred_ok[0]:
             found = self.sign_in_logic._find_user_record(identifier)
             if found:
                 username, record = found
@@ -2747,7 +2831,13 @@ def main():
 
         # ── Startup License Verification Enforcer ──
         try:
-            from utils.license_manager import run_startup_checks, load_stored_key, clear_stored_key, clear_license_cache
+            from utils.license_manager import (
+                run_startup_checks,
+                load_stored_key,
+                clear_stored_key,
+                clear_license_cache,
+                is_stale_seat_error,
+            )
 
             stored_key = load_stored_key()
             if stored_key:
@@ -2789,10 +2879,32 @@ def main():
                         and getattr(result, "error_code", "") == "LICENSE_REVOKED"
                     )
 
+                    # ── Stale token: let the login screen repair it ───────────
+                    # A superseded seat (SEAT_INACTIVE and friends) means only
+                    # that cardiox.lic is out of date. No credentials exist yet
+                    # at startup, so say nothing and open the login screen —
+                    # handle_login() re-syncs the token once the user signs in.
+                    if (
+                        result.step_failed == 5
+                        and not is_explicit_revocation
+                        and is_stale_seat_error(
+                            getattr(result, "error_code", ""), result.reason
+                        )
+                    ):
+                        logger.info(
+                            f"Startup: stale seat reported ({result.error_code}); "
+                            "deferring to login for token re-sync."
+                        )
+                        result = None
+
+                if result is not None and not result.ok:
                     # ── Detect "Seat not found" / seat-missing errors ─────────
                     # This happens when the server DB was reset or the seat was
                     # deleted server-side.  The fix is to clear the stale local
-                    # token and let the user re-register.
+                    # token and let the user re-register. LICENSE_BLOCKED — the
+                    # catch-all run_startup_checks assigns to refusals it cannot
+                    # name — is deliberately excluded, so a transient server
+                    # error can no longer offer to wipe a healthy licence.
                     reason_lower = result.reason.lower()
                     error_code_upper = getattr(result, "error_code", "").upper()
                     _seat_missing_phrases = (
@@ -2806,7 +2918,7 @@ def main():
                         result.step_failed == 5
                         and not is_explicit_revocation
                         and (
-                            error_code_upper in ("SEAT_NOT_FOUND", "LICENSE_BLOCKED")
+                            error_code_upper == "SEAT_NOT_FOUND"
                             or any(p in reason_lower for p in _seat_missing_phrases)
                         )
                     )

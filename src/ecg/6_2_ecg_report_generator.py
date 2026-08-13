@@ -282,7 +282,7 @@ def calculate_time_window_from_width_points(wave_speed_mm_s, width_points):
     return width_mm / max(1e-6, effective_wave_speed_mm_s)
 
 def apply_report_ecg_filters(signal, sampling_rate, settings_manager):
-    from ecg.ecg_filters import apply_ecg_filters, apply_baseline_wander_median_mean, stabilize_report_edges
+    from ecg.ecg_filters import apply_ecg_filters, apply_baseline_wander_median_mean
     arr = np.asarray(signal, dtype=float)
     if arr.size < 10:
         return arr
@@ -324,21 +324,9 @@ def apply_report_ecg_filters(signal, sampling_rate, settings_manager):
             filtered = gaussian_filter1d(filtered, sigma=0.8)  # Match display SMOOTH_SIGMA
     except Exception:
         pass
-    try:
-        n = filtered.size
-        if n > 50:
-            edge_len = max(50, int(0.10 * n))
-            mid_start = n // 3
-            mid_end = (2 * n) // 3
-            start_std = np.std(np.diff(filtered[:edge_len]))
-            end_std = np.std(np.diff(filtered[-edge_len:]))
-            mid_std = np.std(np.diff(filtered[mid_start:mid_end])) + 1e-6
-            start_trim = int(0.05 * n) if start_std > 1.5 * mid_std else 0
-            end_trim = int(0.05 * n) if end_std > 1.5 * mid_std else 0
-            if start_trim + end_trim < n - 20:
-                filtered = filtered[start_trim:n - end_trim]
-    except Exception:
-        pass
+    # No noise-based edge trimming: a burst of activity at the edge is often a real
+    # QRS, and cutting 5% of the strip on that suspicion shortened the printed
+    # waveform. The recorded signal is shown end to end.
     try:
         if filtered.size > 5:
             dif = np.diff(filtered, prepend=filtered[0])
@@ -351,31 +339,14 @@ def apply_report_ecg_filters(signal, sampling_rate, settings_manager):
         pass
     if pad > 0 and filtered.size > 2 * pad:
         filtered = filtered[pad:-pad]
-    try:
-        n2 = filtered.size
-        if n2 > 50:
-            edge_len2 = max(50, int(0.10 * n2))
-            mid_start2 = n2 // 3
-            mid_end2 = (2 * n2) // 3
-            start_std2 = np.std(np.diff(filtered[:edge_len2]))
-            end_std2 = np.std(np.diff(filtered[-edge_len2:]))
-            mid_std2 = np.std(np.diff(filtered[mid_start2:mid_end2])) + 1e-6
-            start_trim2 = int(0.05 * n2) if start_std2 > 1.3 * mid_std2 else 0
-            end_trim2 = int(0.05 * n2) if end_std2 > 1.3 * mid_std2 else 0
-            if start_trim2 + end_trim2 < n2 - 20:
-                filtered = filtered[start_trim2:n2 - end_trim2]
-    except Exception:
-        pass
-    try:
-        n3 = filtered.size
-        if n3 > 100:
-            hard_trim = max(10, int(0.03 * n3))
-            filtered = filtered[hard_trim:n3 - hard_trim]
-    except Exception:
-        pass
-    # Keep natural morphology at strip edges; avoid forced flattening/tapering
-    # that can create artificial terminal humps.
-    filtered = stabilize_report_edges(filtered, fs)
+    # The second noise-based trim and the unconditional 3%-per-side "hard trim" are
+    # gone for the same reason — together they discarded up to 16% of the recorded
+    # strip, and the 3% cut applied even to perfectly clean traces.
+    #
+    # stabilize_report_edges() is not applied either: it cross-fades the ends into a
+    # flat baseline, so a beat near the strip end printed at a fraction of its real
+    # amplitude. Filter transients are already prevented by the reflect padding
+    # applied around the filter chain above.
     try:
         from ecg.ecg_filters import notch_filter_butterworth
         try:
@@ -769,16 +740,11 @@ def create_reportlab_ecg_drawing_with_real_data(lead_name, ecg_data, width=460, 
             coeffs = np.polyfit(x_idx, ecg_mv, 1)
             ecg_mv = ecg_mv - np.polyval(coeffs, x_idx)
         
-        # Gentle head taper only (no forced zero tail)
-        edge_samples = min(40, max(10, len(ecg_mv) // 20))
-        if len(ecg_mv) > edge_samples * 3:
-            t_taper = np.linspace(0.0, 1.0, edge_samples)
-            head_ramp = 0.5 * (1.0 - np.cos(np.pi * t_taper))  # 0→1
-            ecg_mv[:edge_samples] = ecg_mv[:edge_samples] * head_ramp
-            tail_target = float(np.median(ecg_mv[-(edge_samples * 3):-edge_samples])) if len(ecg_mv) > edge_samples * 4 else 0.0
-            tail_ramp = np.linspace(1.0, 0.0, edge_samples)
-            ecg_mv[-edge_samples:] = ecg_mv[-edge_samples:] * tail_ramp + tail_target * (1.0 - tail_ramp)
-    
+        # No head or tail ramp. Despite the old "no forced zero tail" comment, the
+        # tail ramp did fade the last samples into a flat median, shrinking a QRS
+        # that landed there; the head ramp scaled the opening samples toward zero.
+        # Both are cosmetic and the printed strip must show the recorded amplitude.
+
     # Time window clip
     if len(ecg_mv) > max_samples:
         ecg_mv = ecg_mv[-max_samples:]
