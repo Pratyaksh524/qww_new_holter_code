@@ -2792,10 +2792,8 @@ class HolterFullDisclosureDialog(QDialog):
             end_real = datetime.fromtimestamp(self._engine._reader.start_time + end_sec)
             self.lbl_real_time.setText(f"Capture Frame Time: {start_real.strftime('%H:%M:%S')} - {end_real.strftime('%H:%M:%S')}")
         
-        # Update arrhythmia indicator with MANUAL PRIORITY LOGIC
-        # 1. Collect manually annotated beats (non-N) in the current window FIRST
-        manual_events = []
-        manual_timestamps = set()  # Track which timestamps have manual marks
+        # Update arrhythmia indicator based on BADGE LABELS detected in the current window
+        # Collect beats from current window and generate badges
         lead_i_canvas = None
         if hasattr(self, '_canvases'):
             for c in self._canvases:
@@ -2803,64 +2801,46 @@ class HolterFullDisclosureDialog(QDialog):
                     lead_i_canvas = c
                     break
         
-        if lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations') and lead_i_canvas._beat_annotations:
-            for b in lead_i_canvas._beat_annotations:
-                ts = float(b.get('timestamp', 0.0))
-                lbl = b.get('label', 'N')
-                is_manual = b.get('is_manual', False)
-                if lbl != 'N' and start_sec <= ts <= end_sec and is_manual:
-                    manual_events.append({
-                        'timestamp': ts,
-                        'label': lbl,
-                        'source': 'Manual'
-                    })
-                    # Track this timestamp to suppress overlapping auto marks
-                    manual_timestamps.add(round(ts, 2))  # Round for fuzzy matching
-        
-        # 2. Collect automatic events ONLY if they don't overlap with manual marks
-        # Apply 150ms tolerance window for matching
-        auto_events = []
-        SUPPRESS_TOLERANCE_SEC = 0.15
-        for ev in self._events_in_window(start_sec, end_sec):
-            ts = float(ev.get('timestamp', 0.0) or 0.0)
-            
-            # Check if this auto event falls within tolerance of any manual mark
-            is_suppressed = False
-            for manual_ts in manual_timestamps:
-                if abs(ts - manual_ts) < SUPPRESS_TOLERANCE_SEC:
-                    is_suppressed = True
-                    break
-            
-            if not is_suppressed:
-                auto_events.append({
-                    'timestamp': ts,
-                    'label': ev.get('label', 'Event'),
-                    'source': 'Auto'
-                })
-                    
-        # Combine and sort all events by timestamp (manual first, then auto)
-        all_events = sorted(manual_events + auto_events, key=lambda x: x['timestamp'])
-        
-        # Filter out secondary findings that shouldn't appear in the arrhythmia banner
-        EXCLUDED_LABELS = {
-            "Long QT Syndrome",
-            "Prolonged QTc",
-            "Wide QRS (non-specific)",
-            "Frequent PVCs",
-            "Multifocal PVCs"
-        }
-        
         arrhythmia_label = ""
-        if all_events:
-            # Find the first event that is not in the excluded list
-            for event in all_events:
-                label = event.get('label', '')
-                if label not in EXCLUDED_LABELS:
-                    earliest = event
+        
+        if lead_i_canvas and hasattr(lead_i_canvas, '_beat_annotations'):
+            # Get beats in current window
+            window_beats = [b for b in lead_i_canvas._beat_annotations 
+                           if start_sec <= b.get('timestamp', 0.0) <= end_sec]
+            window_events = []
+            
+            # Generate badges for current window using the same logic as badge display
+            try:
+                from ecg.holter.holter_summary_calc import get_template_beats_for_badges
+                badges = get_template_beats_for_badges(window_beats, window_events)
+                
+                # Filter badges to show V, S, AF, P beats
+                arrhythmia_badges = [b for b in badges if b.get('code') in ['V', 'S', 'AF', 'P']]
+                
+                if arrhythmia_badges:
+                    # Sort by timestamp and get the earliest arrhythmia
+                    arrhythmia_badges.sort(key=lambda x: x.get('timestamp', 0.0))
+                    earliest = arrhythmia_badges[0]
+                    
+                    badge_name = earliest.get('name', '')
+                    badge_ts = earliest.get('timestamp', 0.0)
+                    
                     if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
-                        ts_real = datetime.fromtimestamp(self._engine._reader.start_time + earliest['timestamp'])
-                        arrhythmia_label = f"Arrhythmia: {earliest['label']} at {ts_real.strftime('%H:%M:%S')}"
-                    break
+                        ts_real = datetime.fromtimestamp(self._engine._reader.start_time + badge_ts)
+                        arrhythmia_label = f"Arrhythmia: {badge_name} at {ts_real.strftime('%H:%M:%S')}"
+                    else:
+                        arrhythmia_label = f"Arrhythmia: {badge_name}"
+                elif window_beats:
+                    # No arrhythmias detected, show Normal Sinus Rhythm if there are beats in the window
+                    if hasattr(self._engine, '_reader') and hasattr(self._engine._reader, 'start_time'):
+                        first_beat_ts = window_beats[0].get('timestamp', 0.0)
+                        ts_real = datetime.fromtimestamp(self._engine._reader.start_time + first_beat_ts)
+                        arrhythmia_label = f"Arrhythmia: Normal Sinus Rhythm at {ts_real.strftime('%H:%M:%S')}"
+                    else:
+                        arrhythmia_label = "Arrhythmia: Normal Sinus Rhythm"
+                        
+            except Exception as e:
+                print(f"[Full Disclosure] Error updating arrhythmia label from badges: {e}")
                 
         self.lbl_arrhythmia.setText(arrhythmia_label)
 

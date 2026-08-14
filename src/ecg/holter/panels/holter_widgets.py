@@ -1611,7 +1611,18 @@ class ECGStripCanvas(QWidget):
                 # Use beat annotations (which includes all beats in window) and structured events
                 window_beats = getattr(self, '_beat_annotations', [])
                 window_events = getattr(self, '_structured_events', [])
+                
+                # DEBUG: Print what we have
+                if lead_name == 'I':  # Only print once per refresh
+                    print(f"[BADGE DEBUG] Lead={lead_name}, window_beats={len(window_beats)}, window_events={len(window_events)}")
+                
                 badges = get_template_beats_for_badges(window_beats, window_events)
+                
+                if lead_name == 'I':  # Only print once per refresh
+                    print(f"[BADGE DEBUG] Generated {len(badges)} badges")
+                    if badges:
+                        for b in badges[:3]:  # Show first 3
+                            print(f"  Badge: {b['name']} at {b['timestamp']:.2f}s, color={b['color']}")
                 
                 # Add explicitly manual annotations if not already there
                 manual_badges = []
