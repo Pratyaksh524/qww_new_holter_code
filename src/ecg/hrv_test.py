@@ -251,8 +251,10 @@ class HRVTestWindow(QWidget):
     def init_ui(self):
         """Initialize the user interface"""
         import pyqtgraph as pg
-        # Antialiasing: ON to ensure smooth waves without stair-step jagged edges.
-        pg.setConfigOptions(antialias=True)
+        # Antialiasing roughly triples line-drawing cost; the scrolling trace moves
+        # every point each frame, so on the 8 GB / i3 minimum spec that is the
+        # difference between smooth and stuttering. Off there, on elsewhere.
+        pg.setConfigOptions(antialias=not is_low_spec_mode())
         
         self.setStyleSheet("""
             QWidget { background: #0D1117; color: #F9FAFB; }
@@ -426,7 +428,10 @@ class HRVTestWindow(QWidget):
         self.plot_widget.setBackground("#000000")
         self.plot_widget.setMenuEnabled(False)
         self.plot_widget.setClipToView(True)
-        self.plot_widget.setDownsampling(auto=True, mode='peak')
+        # Matches the 12-lead test: no downsampling, plain polyline. Auto 'peak'
+        # downsampling draws each pixel column as a min/max bar, which leaves the
+        # background showing between the bars and speckles the trace.
+        self.plot_widget.setDownsampling(ds=1, auto=False, mode='subsample')
 
         # Disable manual zoom/pan (amplitude lock)
         self.plot_widget.setMouseEnabled(x=False, y=False)
@@ -437,12 +442,13 @@ class HRVTestWindow(QWidget):
         self.plot_widget.hideAxis('left')
         self.plot_widget.hideAxis('bottom')
         
-        # ── Medical monitor sweep display ──────────────────────────────────────
-        # Three layered curves for a realistic ECG glow effect:
+        # ── Scrolling monitor display ──────────────────────────────────────────
+        # Layered curves for a realistic ECG glow effect:
         #   1. Outer glow  (dark green, thick)  — phosphor afterglow
         #   2. Inner trace (bright green, thin)  — actual ECG line
-        #   3. Dot         (bright dot)           — current sweep head
-        #   4. Gap eraser  (black, thick)         — erases ahead of sweep
+        #   3. Dot / 4. Gap eraser — kept for the raster sweep mode but left empty:
+        #      the trace now scrolls, so there is no sweep head to mark and no
+        #      band to erase ahead of it.
 
         self.plot_widget.setXRange(0, 2500, padding=0)
         self.plot_widget.setYRange(0, 4096, padding=0)
@@ -453,7 +459,7 @@ class HRVTestWindow(QWidget):
         )
         # Layer 2 — bright ECG trace (drawn on top of glow)
         self.plot_curve = self.plot_widget.plot(
-            pen=pg.mkPen(color='#00DD00', width=1.5), connect='finite'
+            pen=pg.mkPen(color='#00FF00', width=2.0), connect='finite'
         )
         # Layer 3 — sweep head dot
         self.sweep_dot = self.plot_widget.plot(
@@ -774,6 +780,35 @@ class HRVTestWindow(QWidget):
             return  # Guard: fire only once per disconnection
         
         self._ra_rl_ll_popup_shown = True
+
+        # ── STOP ALL TIMERS & DATA CAPTURE IMMEDIATELY ──────────────────────
+        # Do this before showing the popup so nothing runs in the background
+        # while the user sees the warning dialog.
+        try:
+            self.capture_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.duration_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'metrics_timer'):
+                self.metrics_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_bpm_refresh_timer') and self._bpm_refresh_timer.isActive():
+                self._bpm_refresh_timer.stop()
+        except Exception:
+            pass
+        # Stop serial reader so no new data packets arrive
+        try:
+            if self.serial_reader:
+                self.serial_reader.running = False
+        except Exception:
+            pass
+        self.is_capturing = False
 
         popup_title = "Warning"
         popup_text = "ECG Electrode disconnected, please check electrode connection"
@@ -1218,7 +1253,11 @@ class HRVTestWindow(QWidget):
                 centered = (buffer_data - self._hrv_display_anchor) * gain_factor
                 display_values = np.clip(2048.0 + centered, 0, 4096)
 
-                # ── Medical monitor raster sweep render ───────────────────────
+                # ── Scrolling render (no raster sweep) ────────────────────────
+                # The trace slides right-to-left with the newest sample pinned to
+                # the right edge, so there is no eraser bar travelling across the
+                # waveform. Samples are still written into the circular buffer
+                # below; only the presentation differs.
                 SWEEP_N = 2500
 
                 if n_new > 0 and len(display_values) > 0:
@@ -1227,6 +1266,13 @@ class HRVTestWindow(QWidget):
                     max_step = 180.0  # reject single-sample spikes from packet glitches
                     for v in new_vals:
                         y = float(np.clip(v, 0, 4096))
+                        # A non-finite sample would sit in the buffer forever and,
+                        # because the curve uses connect='finite', print as a black
+                        # dot in the trace. np.clip leaves NaN as NaN and the
+                        # max_step guard below cannot catch it, so hold the last
+                        # good value instead.
+                        if not np.isfinite(y):
+                            y = self._last_sweep_y
                         if abs(y - self._last_sweep_y) > max_step:
                             y = self._last_sweep_y + float(np.clip(y - self._last_sweep_y, -max_step, max_step))
                         self._sweep_buf[self._sweep_pos] = y
@@ -1235,20 +1281,19 @@ class HRVTestWindow(QWidget):
 
                 pos = self._sweep_pos
                 buf = self._sweep_buf
-                gap = self._sweep_gap
                 x_axis = np.arange(SWEEP_N, dtype=float)
 
-                y_display, head_pos, gap_x, gap_y = build_raster_sweep_frame(
-                    buf, pos, gap, baseline=2048.0
-                )
+                # Rotate the circular buffer so the oldest sample is on the left
+                # and the newest lands on the right edge. Nothing is blanked, so
+                # the waveform is continuous across the whole width.
+                y_display = np.roll(buf, -int(pos))
+                y_display = np.nan_to_num(y_display, nan=2048.0, posinf=4096.0, neginf=0.0)
 
                 self.plot_curve_glow.setData(x_axis, y_display)
-                self.plot_curve.setData(x_axis, y_display, connect='finite')
-                self.sweep_gap_curve.setData(gap_x, gap_y)
-                dot_y = float(y_display[head_pos]) if head_pos < len(y_display) else 2048.0
-                if not np.isfinite(dot_y):
-                    dot_y = 2048.0
-                self.sweep_dot.setData([float(head_pos)], [dot_y])
+                self.plot_curve.setData(x_axis, y_display)
+                # Eraser bar and sweep head belong to the raster mode only.
+                self.sweep_gap_curve.setData([], [])
+                self.sweep_dot.setData([], [])
 
                 self.plot_widget.setXRange(0, SWEEP_N, padding=0)
                 self.plot_widget.setYRange(0, 4096, padding=0)

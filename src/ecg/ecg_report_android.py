@@ -967,11 +967,9 @@ def _prepare_report_waveform(samples, width_mm, target_samples=None):
     except Exception:
         pass
 
-    try:
-        from ecg.ecg_filters import stabilize_report_edges
-        work = stabilize_report_edges(work, float(ECG_FS), edge_ms=140.0)
-    except Exception:
-        pass
+    # No edge taper — see ecg_report_generator.apply_report_ecg_filters(). Fading the
+    # strip ends into a flat baseline shrank any QRS near the boundary; the reflect
+    # padding applied around the filters above already prevents transients.
 
     if work.size > core_n:
         chosen_start = work.size - core_n

@@ -66,6 +66,72 @@ def _stage_json_placeholder(staging_dir: Path, dst_name: str) -> Path:
 _DEFAULT_DIST_LICENSE_SERVER_URL = "https://m4qoae4d8e.execute-api.us-east-1.amazonaws.com/prod/api/v1"
 
 
+# Secrets that must NEVER reach a customer machine. The desktop app does not read
+# any of these at runtime:
+#   * LICENSE_API_TOKEN is the license *admin* token — it authorises /admin/licenses,
+#     /admin/create and /admin/revoke. Verified unnecessary for the client: the
+#     /api/v1/* endpoints accept requests with no X-API-Key header at all.
+#   * LICENSE_HMAC_SECRET signs client requests, but the server does not verify the
+#     signature (its HMAC_SECRET is a different value), so omitting it changes nothing.
+#   * The remaining entries belong to cloud backends that are not in use — CLOUD_SERVICE
+#     is 's3', so the Azure / GCS / FTP / Dropbox credentials are dead weight.
+_DIST_ENV_DENY: set[str] = {
+    "LICENSE_API_TOKEN",
+    "LICENSE_HMAC_SECRET",
+    "AZURE_STORAGE_CONNECTION_STRING",
+    "AZURE_CONTAINER_NAME",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GCS_BUCKET_NAME",
+    "DROPBOX_ACCESS_TOKEN",
+    "FTP_HOST",
+    "FTP_PORT",
+    "FTP_USERNAME",
+    "FTP_PASSWORD",
+    "FTP_REMOTE_PATH",
+    "EMAIL_PASSWORD",
+    "SUPPORT_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    # Developer auto-login bypass. Skips the password prompt AND the licence gate
+    # (heartbeat / revocation / offline grace), so it must never reach a customer.
+    "CARDIOX_DEV_AUTOLOGIN",
+}
+
+# Substrings that indicate a secret. Any *new* key matching one of these must be
+# explicitly acknowledged in _DIST_ENV_KNOWN_SHIPPED below, otherwise the build
+# aborts — so adding a credential to .env can never silently ship to customers.
+_DIST_ENV_SECRET_HINTS: tuple[str, ...] = (
+    "SECRET", "PASSWORD", "TOKEN", "_KEY", "APIKEY", "CREDENTIAL", "PRIVATE",
+)
+
+# Credentials that still ship because the app genuinely needs them today.
+# Each one is a known exposure, not an endorsement — see the remediation notes:
+#   * AWS_* — cloud_uploader.py talks to S3 directly (CLOUD_SERVICE=s3). Should be
+#     replaced by presigned URLs issued by the backend, so no key ships at all.
+#   * *_API_KEY for the report/chatbot gateways — should become per-install tokens
+#     issued at registration rather than one shared key baked into every copy.
+#   * CARDIOX_ADMIN_* — identical admin password on every install; should be removed
+#     or made per-install.
+_DIST_ENV_KNOWN_SHIPPED: set[str] = {
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "DOCTOR_REVIEW_API_KEY",
+    "DOCTOR_UPLOAD_API_KEY",
+    "REVIEWED_REPORTS_API_KEY",
+    "PUBLIC_API_KEY",
+    "BACKEND_API_KEY",
+    "CLOUD_API_KEY",
+    "ECG_UNIFIED_API_KEY",
+    "CHATBOT_API_KEY",
+    "GROQ_API_KEY",
+    "ECG_UPDATE_TELEMETRY_API_KEY",
+    "CARDIOX_ADMIN_USER",
+    "CARDIOX_ADMIN_PASS",
+    "ADMIN_USERNAME",
+    "ADMIN_PASSWORD",
+}
+
+
 def _stage_env_for_distribution(src: Path, staging_dir: Path) -> Path | None:
     """
     Stage a .env file for distribution.
@@ -73,6 +139,8 @@ def _stage_env_for_distribution(src: Path, staging_dir: Path) -> Path | None:
     Behavior:
     - Copy `.env` into staging and normalize LICENSE_SERVER_URL to the remote
       production gateway used by the distributed app.
+    - Drop every entry in _DIST_ENV_DENY so server-side secrets never ship.
+    - Abort the build if an unrecognised secret-looking key would be distributed.
     - You can override the distributed URL via BUILD_LICENSE_SERVER_URL at build time.
     """
     if not src.exists():
@@ -89,15 +157,47 @@ def _stage_env_for_distribution(src: Path, staging_dir: Path) -> Path | None:
     dist_url = os.getenv("BUILD_LICENSE_SERVER_URL", "").strip() or _DEFAULT_DIST_LICENSE_SERVER_URL
 
     out_lines: list[str] = []
+    shipped_names: list[str] = []
+    dropped: list[str] = []
+
     for line in raw:
         stripped = line.strip()
         if stripped.startswith("LICENSE_SERVER_URL="):
             out_lines.append(f"LICENSE_SERVER_URL={dist_url}")
+            shipped_names.append("LICENSE_SERVER_URL")
             continue
+
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            out_lines.append(line)
+            continue
+
+        name = stripped.split("=", 1)[0].strip()
+        if name in _DIST_ENV_DENY:
+            dropped.append(name)
+            continue
+
         out_lines.append(line)
+        shipped_names.append(name)
 
     if not any(line.strip().startswith("LICENSE_SERVER_URL=") for line in out_lines):
         out_lines.append(f"\nLICENSE_SERVER_URL={dist_url}")
+
+    # Fail closed: a secret-looking key that nobody has vetted must not ship.
+    unvetted = [
+        name for name in shipped_names
+        if any(hint in name.upper() for hint in _DIST_ENV_SECRET_HINTS)
+        and name not in _DIST_ENV_KNOWN_SHIPPED
+    ]
+    if unvetted:
+        raise SystemExit(
+            "REFUSING TO BUILD — unvetted secret(s) would ship inside the installer: "
+            f"{sorted(unvetted)}\n"
+            "Add each name to _DIST_ENV_DENY (preferred) or, if the app truly needs it "
+            "at runtime, to _DIST_ENV_KNOWN_SHIPPED in build_exe.py."
+        )
+
+    if dropped:
+        print(f"  [env] stripped {len(dropped)} server-side secret(s): {sorted(dropped)}")
 
     try:
         target.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
