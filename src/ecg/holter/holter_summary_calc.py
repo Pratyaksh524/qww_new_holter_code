@@ -271,6 +271,151 @@ def format_duration(seconds: float) -> str:
     s = int(seconds % 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+
+def _reclassify_beats_advanced(beats: List[Dict[str, Any]]) -> None:
+    """
+    Re-classify beats in-place using the full Layer 1 + Layer 2 algorithm.
+
+    Layer 1 — Feature extraction per beat i:
+      RRmean  : EMA over sinus (N) beats only.  alpha=0.125
+                  RRmean = 0.875*RRmean + 0.125*RR(i)   (update only when beat is N)
+      P(i)    : prematurity ratio  = RR(i)      / RRmean
+      Q(i)    : post-beat ratio    = RR(i+1)    / RRmean  (compensatory pause proxy)
+      W(i)    : QRS width in ms    = beat['qrs_ms']
+      M(i)    : morphology score   = normalized cross-correlation(QRS_i, sinus_template)
+                  0..1; >=0.85 → same morphology as sinus
+
+    Layer 2 — Classification rules (morphology outweighs timing when they conflict):
+      Wide + premature  (W>120, P<0.95)             → V
+      Bizarre morph     (M<0.70, premature or wide)  → V
+      Wide + compensatory pause (P+Q ≈ 2)            → V  (even if marginally early)
+      Narrow + premature + normal morph              → S  (PAC/SVE)
+      Narrow + premature + non-compensatory          → S  (sinus-node reset)
+      else                                           → keep original label
+
+    Only auto-detected beats are reclassified; manual beats are left unchanged
+    (but their RR still updates the EMA when they are labelled N).
+    """
+    if len(beats) < 3:
+        return
+
+    # ------------------------------------------------------------------
+    # Step 1 – Build sinus template from beats already labelled N
+    # ------------------------------------------------------------------
+    sinus_segments = []
+    for b in beats:
+        seg = b.get('segment')
+        if seg is None:
+            continue
+        lbl = str(b.get('label', 'N')).upper()
+        code = lbl.split('(')[1].split(')')[0] if ('(' in lbl and ')' in lbl) else lbl
+        if code == 'N':
+            arr = np.asarray(seg, dtype=float)
+            if arr.size >= 8:
+                sinus_segments.append(arr)
+
+    sinus_template = None
+    if sinus_segments:
+        min_len = min(s.size for s in sinus_segments)
+        if min_len >= 8:
+            aligned = np.stack([s[:min_len] for s in sinus_segments])
+            sinus_template = np.median(aligned, axis=0)  # robust average
+
+    # ------------------------------------------------------------------
+    # Step 2 – Initialise EMA baseline from median of all valid RR values
+    # ------------------------------------------------------------------
+    valid_rr = [float(b.get('rr_ms', 0.0) or 0.0)
+                for b in beats if 300 < float(b.get('rr_ms', 0.0) or 0.0) < 2000]
+    rr_ema = float(np.median(valid_rr)) if valid_rr else 800.0
+    alpha  = 0.125   # EMA weight (0.875 × old + 0.125 × new)
+
+    # ------------------------------------------------------------------
+    # Step 3 – Walk through beats and (re)classify each one
+    # ------------------------------------------------------------------
+    n = len(beats)
+    for i, beat in enumerate(beats):
+        rr_i  = float(beat.get('rr_ms',  0.0) or 0.0)
+        qrs_w = float(beat.get('qrs_ms', 0.0) or 0.0)
+
+        # For manual beats: skip reclassification but still update EMA
+        if beat.get('is_manual', False):
+            lbl  = str(beat.get('label', 'N')).upper()
+            code = lbl.split('(')[1].split(')')[0] if ('(' in lbl and ')' in lbl) else lbl
+            if code == 'N' and 300 < rr_i < 2000:
+                rr_ema = (1 - alpha) * rr_ema + alpha * rr_i
+            continue
+
+        # --- Layer 1: compute features ---
+        P_i = rr_i / rr_ema if (rr_ema > 0 and rr_i > 0) else 1.0
+
+        # Q(i): post-ectopic pause — use next beat's RR
+        Q_i = 1.0
+        if i + 1 < n:
+            rr_next = float(beats[i + 1].get('rr_ms', 0.0) or 0.0)
+            Q_i = rr_next / rr_ema if (rr_ema > 0 and rr_next > 0) else 1.0
+
+        # M(i): morphology similarity against sinus template
+        M_i = 1.0   # assume similar when no segment data available
+        seg = beat.get('segment')
+        if sinus_template is not None and seg is not None:
+            try:
+                arr = np.asarray(seg, dtype=float)
+                if arr.size >= 8:
+                    min_len = min(arr.size, sinus_template.size)
+                    a = arr[:min_len]
+                    t = sinus_template[:min_len]
+                    a_std = float(np.std(a))
+                    t_std = float(np.std(t))
+                    if a_std > 1e-9 and t_std > 1e-9:
+                        a_n = (a - float(np.mean(a))) / a_std
+                        t_n = (t - float(np.mean(t))) / t_std
+                        corr = np.correlate(a_n, t_n, mode='valid')
+                        M_i  = max(-1.0, min(1.0, float(np.max(corr)) / float(min_len)))
+            except Exception:
+                pass
+
+        # Compensatory pause: P(i)+Q(i) ≈ 2 → V; < 2 → S (sinus reset)
+        compensatory = (P_i + Q_i) >= 1.85   # within ~8% of 2.0
+
+        # --- Layer 2: classification rules ---
+        new_code = None
+
+        # R1: Wide QRS + early → V  (QRS width dominates)
+        if qrs_w > 120 and P_i < 0.95:
+            new_code = 'V'
+
+        # R2: Bizarre morphology + premature or wide → V
+        if new_code is None and M_i < 0.70 and (P_i < 0.95 or qrs_w > 110):
+            new_code = 'V'
+
+        # R3: Wide + full compensatory pause → V  (even borderline width)
+        if new_code is None and qrs_w > 110 and compensatory:
+            new_code = 'V'
+
+        # R4: Narrow + premature + normal morphology → S  (PAC/SVE)
+        if new_code is None and P_i < 0.80 and qrs_w <= 120 and M_i >= 0.70:
+            new_code = 'S'
+
+        # R5: Narrow + premature + non-compensatory → S  (sinus-node reset)
+        if new_code is None and P_i < 0.90 and not compensatory and qrs_w <= 120:
+            new_code = 'S'
+
+        # R6: Fallback — keep original label from analysis_worker
+        if new_code is None:
+            orig_lbl  = str(beat.get('label', 'N')).upper()
+            orig_code = (orig_lbl.split('(')[1].split(')')[0]
+                         if ('(' in orig_lbl and ')' in orig_lbl) else orig_lbl)
+            new_code = orig_code if orig_code in ['V', 'S', 'N', 'AF', 'P'] else 'N'
+
+        # Apply new classification
+        beat['short_code'] = new_code
+        if new_code in ('V', 'S'):
+            beat['label'] = new_code
+
+        # Update EMA baseline only for beats classified as sinus
+        if new_code == 'N' and 300 < rr_i < 2000:
+            rr_ema = (1 - alpha) * rr_ema + alpha * rr_i
+
 def get_template_beats_for_badges(beats: List[Dict[str, Any]], arrhythmias: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Generate rich badge items for ALL ventricular ectopy (VE), supraventricular ectopy (SVE),
@@ -319,7 +464,12 @@ def get_template_beats_for_badges(beats: List[Dict[str, Any]], arrhythmias: List
                 'critical': 'ventricular' in lbl_lower
             })
             
-    # 2. Add individual ectopic beats (ALL V, S, AF beats) with rhythm context and interval data
+    # 2. Re-classify auto-detected beats using full Layer 1+2 algorithm
+    #    (EMA baseline, prematurity P(i), compensatory pause Q(i), QRS width W(i), morphology M(i))
+    #    This upgrades the simplified analysis_worker labels before pattern sequencing.
+    _reclassify_beats_advanced(auto_beats)
+
+    # 3. Add individual ectopic beats (ALL V, S, AF beats) with rhythm context and interval data
     label_beat_sequences(auto_beats)
     
     for beat in auto_beats:
@@ -354,6 +504,10 @@ def get_template_beats_for_badges(beats: List[Dict[str, Any]], arrhythmias: List
         
         # Determine color and priority based on pattern
         color, priority = _get_badge_appearance(code, pattern, beat)
+
+        # Suppress white default/normal badges (e.g. [TACHY] Normal)
+        if not color or color.upper() in ['#FFFFFF', '#FFF', 'WHITE']:
+            continue
         
         # Extract PR, QRS, QT/QTc if available from auto-detection results
         qrs = beat.get('qrs_ms')

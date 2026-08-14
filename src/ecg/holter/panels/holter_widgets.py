@@ -1656,6 +1656,11 @@ class ECGStripCanvas(QWidget):
                         ts = badge['timestamp']
                         if not (self._start_sec <= ts <= end_sec):
                             continue
+
+                        color = badge.get('color', '#FFFFFF')
+                        # Skip white labels (e.g. [TACHY] Normal) - only render colored arrhythmia badges
+                        if color and color.upper() in ['#FFFFFF', '#FFF', 'WHITE']:
+                            continue
                         
                         pct = (ts - self._start_sec) / (end_sec - self._start_sec) if (end_sec - self._start_sec) > 0 else 0.0
                         bx = int(pct * w)
