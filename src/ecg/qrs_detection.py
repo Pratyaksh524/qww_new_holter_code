@@ -7,19 +7,43 @@ Paper: Curtin et al., "QRS Complex Detection and Measurement Algorithms for
 
 COMPLETE PIPELINE — Stages 1 through 10
 ────────────────────────────────────────
-QRS Detection (Stages 1–5):       ← NEW — added to existing file
+QRS Detection (Stages 1–5):
   Stage 1 → Channel grouping + averaging
   Stage 2 → Peak detection (amplitude + width criteria)
   Stage 3 → QRS complex windowing (PR + QT approximation)
   Stage 4 → Additional complex identification
   Stage 5 → Morphology classification (PM vs OM)
 
-QRS Duration Measurement (Stages 6–10):   ← EXISTING — unchanged
+QRS Duration Measurement (Stages 6–10):
   Stage 6 → Reference peak identification + significant peaks detection
   Stage 7 → Array-specific peak groups (anterior / posterior)
-  Stage 8 → Channel-specific border delineation (amplitude + slope criteria)
+  Stage 8 → Channel-specific border delineation  ← UPGRADED (Curtin 2018 strict)
   Stage 9 → Array-specific border delineation (normal group within 20 ms)
   Stage 10→ Global border delineation (earliest anterior + latest posterior)
+
+UPGRADES vs previous version (integrated from ECGAnalyzer.kt / ecg_qrs_detector.py):
+  UPGRADE-1 (delineate_channel_borders / Stage 8):
+    - True isoelectric baseline from TP segment trimmed mean (10-90th pct)
+      instead of abs(signal[i]) which assumed baseline=0.  Fixes +40-60ms
+      offset overestimate on real ECG with 0.1-0.2 mV post-filter drift.
+    - BBB detection: signal still active at R+100ms (>18% R amplitude) →
+      flag as BBB and relax offset amplitude fraction to 0.45 + fewer
+      confirmation samples to avoid overshooting slurred S-wave.
+    - Onset: scan backwards with amplitude + slope gate + 5-sample rising
+      confirmation (≥3 of 5 samples must be rising past 50% threshold).
+    - Offset: sliding stability gate — N consecutive samples must be below
+      amplitude threshold AND below 2× slope threshold simultaneously.
+      confirmSamp = 3-6 depending on HR and BBB status.
+    - QRS duration cap raised: normal HR ≤100 → 200ms (was ~130ms via
+      0.20 ratio), allowing RBBB/LBBB (120-200ms) to be measured correctly.
+
+  UPGRADE-2 (qrs_duration_from_raw_signal):
+    - New _curtin_validate_peaks() pre-pass: amplitude + half-width
+      down-selection (±0.10 mV, ±20 ms) and 81ms intra-complex merge,
+      exactly matching Curtin 2018 §2b-§2d.
+    - _curtin_find_significant_peaks_local(): Q/S extended to 120ms from R
+      (was 52ms) to capture terminal deflections in RBBB/LBBB.
+    - Two-pass window (80ms/160ms) retained; now also uses Curtin borders.
 
 INTEGRATION WITH EXISTING CODEBASE:
   # Old (scipy find_peaks):
@@ -66,12 +90,22 @@ PEAK_AMPLITUDE_GROUP_TOL_MV:         float = 0.1    # ±0.1 mV grouping toleranc
 PEAK_WIDTH_GROUP_TOL_MS:             float = 20.0   # ±20 ms width grouping tolerance
 MAX_INTRA_COMPLEX_PEAK_DIST_MS:      float = 81.0   # max intra-complex peak spacing
 MAX_ARRAY_PEAK_SPACING_MS:           float = 52.0   # Stage 7 outlier removal
-QRS_BORDER_AMPLITUDE_RATIO:          float = 0.20   # FIX: was 0.50 → QRS=72ms; 0.20 → target 86ms
-QRS_BORDER_SLOPE_THRESHOLD_MV_PER_MS: float = 0.015 # FIX: was 0.025 → target 0.015
+QRS_BORDER_AMPLITUDE_RATIO:          float = 0.50   # Curtin 2018 Table 2 §8: 50% of closest peak
+QRS_BORDER_SLOPE_THRESHOLD_MV_PER_MS: float = 0.025 # Curtin 2018 Table 2 §8: 2.5×10⁻² mV/ms
 ARRAY_BORDER_NORMAL_GROUP_TOLERANCE_MS: float = 20.0
 HR_WINDOW_MIN_BPM: int = 40
 HR_WINDOW_MAX_BPM: int = 120
 MIN_SIGNIFICANT_PEAK_HEIGHT_RATIO: float = 0.10
+
+# ── Curtin 2018 border delineation constants (UPGRADE-1) ─────────────────────
+# These are used in the upgraded delineate_channel_borders() and
+# qrs_duration_from_raw_signal() below.
+_CURTIN_BORDER_AMP_FRACTION   = 0.50   # §8: amplitude must drop below 50% of peak dev
+_CURTIN_BORDER_SLOPE_MV_PER_MS = 0.025 # §8: slope threshold 2.5×10⁻² mV/ms
+_CURTIN_PEAK_AMP_TOL_MV       = 0.10   # §2b: ±0.10 mV amplitude tolerance
+_CURTIN_PEAK_WIDTH_TOL_MS     = 20.0   # §2b: ±20 ms half-width tolerance
+_CURTIN_MAX_INTRA_COMPLEX_MS  = 81.0   # §2d: 81 ms intra-complex merge limit
+_CURTIN_MAX_SIG_PEAK_MS       = 120.0  # §6 extended (RBBB/LBBB): was 52 ms
 
 # Physiological QRS limits
 QRS_DURATION_MIN_MS: float = 40.0
@@ -783,33 +817,103 @@ def delineate_channel_borders(signal: np.ndarray,
                                fs: float,
                                adc_per_mv: float = 1.0
                                ) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Stage 8 — QRS onset and offset delineation.
+
+    UPGRADED to Curtin 2018 §8 / §10 algorithm (ported from ECGAnalyzer.kt):
+      • True isoelectric baseline from TP segment trimmed mean [10-90th pct],
+        60-10 samples before the QRS window.  This replaces the old
+        abs(signal[i]) comparison which assumed baseline=0 and systematically
+        over-estimated offset by 40-60 ms on filtered ECG with residual drift.
+      • BBB detection: if signal amplitude at R+100 ms > 18% of R amplitude,
+        the complex is flagged as BBB-type and the offset fraction is relaxed
+        to 0.45 (vs 0.50 normal) with fewer confirmation samples.
+      • Onset: backward scan with amplitude + slope gate plus a rising-signal
+        confirmation (≥3 of 5 forward samples must exceed 50% threshold).
+      • Offset: forward scan with amplitude + slope gate plus sliding stability
+        window (confirmSamp consecutive samples all below threshold).
+    """
     if not significant_peaks:
         return None, None
 
-    earliest = significant_peaks[0]
-    latest   = significant_peaks[-1]
-    slope_thr = QRS_BORDER_SLOPE_THRESHOLD_MV_PER_MS * adc_per_mv * fs / 1000.0
+    # ── slope threshold (per sample, signal-scale independent) ──────────────
+    slope_thr_per_samp = _CURTIN_BORDER_SLOPE_MV_PER_MS * 1000.0 / fs
 
-    # ONSET
-    onset_idx     = max(0, qrs_window_start)
-    amp_thr_onset = QRS_BORDER_AMPLITUDE_RATIO * abs(signal[earliest])
-    for i in range(earliest - 1, max(0, qrs_window_start) - 1, -1):
-        if abs(signal[i]) < amp_thr_onset and abs(signal[i] - signal[i+1]) < slope_thr:
-            onset_idx = i
-            break
+    # ── True isoelectric baseline (TP segment before the QRS window) ────────
+    # 60-10 samples before window start; trimmed mean (10-90th pct) for noise
+    baseline_start = max(0, qrs_window_start - 60)
+    baseline_end   = max(0, qrs_window_start - 10)
+    if baseline_end > baseline_start:
+        seg = sorted(signal[baseline_start:baseline_end].tolist())
+        t1  = int(len(seg) * 0.10)
+        t2  = len(seg) - t1
+        iso_baseline = float(np.mean(seg[t1:t2])) if t2 > t1 else float(np.mean(seg))
     else:
-        onset_idx = max(0, qrs_window_start)
+        iso_baseline = 0.0
 
-    # OFFSET
-    offset_idx     = min(len(signal) - 1, qrs_window_end - 1)
-    amp_thr_offset = QRS_BORDER_AMPLITUDE_RATIO * abs(signal[latest])
-    for i in range(latest + 1, min(len(signal), qrs_window_end)):
-        slope_ok = abs(signal[i] - signal[i-1]) < slope_thr if i > 0 else True
-        if abs(signal[i]) < amp_thr_offset and slope_ok:
-            offset_idx = i
-            break
+    # ── BBB detection: is signal still active at R+100 ms? ──────────────────
+    check_samp  = min(ref_peak_idx + int(fs * 100 / 1000),
+                      qrs_window_end - 1, len(signal) - 1)
+    r_peak_amp  = abs(float(signal[ref_peak_idx]) - iso_baseline)
+    amp_at_100  = abs(float(signal[check_samp])   - iso_baseline)
+    is_bbb      = (r_peak_amp > 1e-9) and (amp_at_100 > r_peak_amp * 0.18)
+
+    # ── QRS ONSET ────────────────────────────────────────────────────────────
+    # Reference: first (leftmost) significant peak — usually the Q wave.
+    q_peak = significant_peaks[0]
+    onset_peak_dev = abs(float(signal[q_peak]) - iso_baseline)
+    onset_amp_thr  = onset_peak_dev * _CURTIN_BORDER_AMP_FRACTION
+
+    onset_idx = max(0, qrs_window_start)  # default: window start
+    for k in range(q_peak - 1, max(0, qrs_window_start) - 1, -1):
+        dev   = abs(float(signal[k]) - iso_baseline)
+        slope = abs(float(signal[k + 1]) - float(signal[k])) if k + 1 < len(signal) else 0.0
+        if dev < onset_amp_thr and slope < slope_thr_per_samp:
+            # Confirm: ≥3 of next 5 samples must be rising above 50% threshold
+            rising_count = 0
+            for j in range(1, 6):
+                nk = k + j
+                if (nk < len(signal)
+                        and abs(float(signal[nk]) - iso_baseline) > onset_amp_thr * 0.5):
+                    rising_count += 1
+            if rising_count >= 3:
+                onset_idx = k + 1
+                break
+
+    # ── QRS OFFSET ───────────────────────────────────────────────────────────
+    # Reference: last (rightmost) significant peak — usually the S wave.
+    s_peak = significant_peaks[-1]
+    offset_peak_dev = abs(float(signal[s_peak]) - iso_baseline)
+
+    # BBB: slurred S-wave requires a relaxed amplitude fraction
+    if is_bbb:
+        offset_amp_fraction = 0.45
+        confirm_samp = 3
     else:
-        offset_idx = min(len(signal) - 1, qrs_window_end - 1)
+        offset_amp_fraction = _CURTIN_BORDER_AMP_FRACTION  # 0.50
+        # HR-derived confirmation count from calling context is not directly
+        # available here, so use a moderate default of 5 (≈normal sinus)
+        confirm_samp = 5
+
+    offset_amp_thr = offset_peak_dev * offset_amp_fraction
+    offset_idx = min(len(signal) - 1, qrs_window_end - 1)  # default: window end
+
+    k = s_peak + 1
+    while k < min(len(signal), qrs_window_end) - confirm_samp:
+        dev   = abs(float(signal[k]) - iso_baseline)
+        slope = abs(float(signal[k + 1]) - float(signal[k])) if k + 1 < len(signal) else 0.0
+        if dev < offset_amp_thr and slope < slope_thr_per_samp:
+            stable_count = 0
+            for j in range(1, confirm_samp + 1):
+                nk = k + j
+                if (nk < len(signal)
+                        and abs(float(signal[nk]) - iso_baseline) < offset_amp_thr
+                        and abs(float(signal[nk]) - float(signal[nk - 1])) < slope_thr_per_samp * 2.0):
+                    stable_count += 1
+            if stable_count >= (confirm_samp + 1) // 2:
+                offset_idx = k
+                break
+        k += 1
 
     if onset_idx >= offset_idx:
         return None, None
@@ -1025,89 +1129,263 @@ def compute_global_qrs_duration_mecg(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CURTIN 2018 PEAK VALIDATION HELPERS  (UPGRADE-2)
+# Ported from ECGAnalyzer.kt curtinValidatePeaks() and curtinFindSignificantPeaks()
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _curtin_validate_peaks(signal: np.ndarray,
+                            candidate_peaks: List[int],
+                            fs: float) -> List[int]:
+    """
+    Curtin 2018 §2b-§2d: amplitude + half-width down-selection,
+    then intra-complex merge (peaks within 81 ms → keep the largest).
+
+    This replaces the simpler amplitude-only filter that was used before
+    find_significant_peaks(), preventing T-wave and noise peaks from being
+    treated as QRS peaks and inflating the measured duration.
+    """
+    if not candidate_peaks:
+        return []
+
+    # Per-second amplitude ranges → global threshold = 50% of mean range
+    window_thresh: List[float] = []
+    idx = 0
+    while idx < len(signal):
+        sl = signal[idx: idx + int(fs)]
+        if len(sl) > 0:
+            window_thresh.append(float(np.max(sl) - np.min(sl)))
+        idx += int(fs)
+    global_thr = float(np.mean(window_thresh)) * 0.5 if window_thresh else 0.0
+
+    amp_filtered = [p for p in candidate_peaks
+                    if 0 <= p < len(signal) and abs(float(signal[p])) > global_thr]
+    if not amp_filtered:
+        return candidate_peaks  # safety: return all if nothing passes
+
+    # Amplitude mode filter (±0.10 mV)
+    amps = sorted(abs(float(signal[p])) for p in amp_filtered)
+    mode_amp = amps[len(amps) // 2]
+    amp_valid = [p for p in amp_filtered
+                 if abs(abs(float(signal[p])) - mode_amp) <= _CURTIN_PEAK_AMP_TOL_MV]
+
+    # Half-maximum width filter (±20 ms)
+    def _half_max_width_ms(pk: int) -> float:
+        half = abs(float(signal[pk])) * 0.5
+        left = right = pk
+        while left > 0 and abs(float(signal[left - 1])) > half:
+            left -= 1
+        while right < len(signal) - 1 and abs(float(signal[right + 1])) > half:
+            right += 1
+        return (right - left) * 1000.0 / fs
+
+    widths = [(p, _half_max_width_ms(p)) for p in amp_valid]
+    if not widths:
+        return amp_filtered
+    mode_w = sorted(w for _, w in widths)[len(widths) // 2]
+    width_valid = [p for p, w in widths
+                   if abs(w - mode_w) <= _CURTIN_PEAK_WIDTH_TOL_MS]
+    if not width_valid:
+        return amp_filtered
+
+    # Intra-complex merge: peaks within 81 ms → keep the largest amplitude
+    max_intra_samp = int(_CURTIN_MAX_INTRA_COMPLEX_MS / 1000.0 * fs)
+    merged: List[int] = []
+    gi = 0
+    while gi < len(width_valid):
+        group = [width_valid[gi]]
+        j = gi + 1
+        while j < len(width_valid) and width_valid[j] - group[-1] <= max_intra_samp:
+            group.append(width_valid[j])
+            j += 1
+        merged.append(max(group, key=lambda p: abs(float(signal[p]))))
+        gi = j
+
+    return merged
+
+
+def _curtin_find_q_s_peaks(signal: np.ndarray,
+                             r_peak: int,
+                             win_start: int,
+                             win_end: int,
+                             fs: float) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Curtin 2018 §6 — significant Q and S peaks relative to R.
+
+    Extends the search to 120 ms from R (instead of Curtin's original 52 ms)
+    to capture terminal deflections in RBBB (slurred S, R') and LBBB
+    (notched R, deep S), exactly as done in ECGAnalyzer.kt.
+
+    Returns (q_idx, s_idx) — either may be None.
+    """
+    max_space_samp = int(_CURTIN_MAX_SIG_PEAK_MS / 1000.0 * fs)   # 120 ms
+    ref_amp   = float(signal[r_peak])
+    ref_height = abs(ref_amp)
+
+    # Reference ascending-flank max slope (up to 20 samples before R)
+    slope_win = min(20, r_peak)
+    ref_slope = 0.0
+    for k in range(r_peak - slope_win, r_peak):
+        if 0 <= k and k + 1 < len(signal):
+            s = abs(float(signal[k + 1]) - float(signal[k]))
+            if s > ref_slope:
+                ref_slope = s
+
+    # ── Q peak (before R) ────────────────────────────────────────────────────
+    q_idx: Optional[int] = None
+    q_scan_start = max(win_start, r_peak - max_space_samp)
+    q_scan_end   = max(q_scan_start, r_peak - 3)
+    if q_scan_end > q_scan_start:
+        local_min = float(signal[q_scan_start])
+        local_min_idx = q_scan_start
+        for k in range(q_scan_start, q_scan_end):
+            if float(signal[k]) < local_min:
+                local_min = float(signal[k])
+                local_min_idx = k
+        c_height = abs(local_min)
+        scale    = c_height / ref_height if ref_height > 1e-9 else 0.0
+        c_slope  = 0.0
+        for k in range(local_min_idx, min(local_min_idx + 5, r_peak)):
+            if k + 1 < len(signal):
+                s = abs(float(signal[k + 1]) - float(signal[k]))
+                if s > c_slope:
+                    c_slope = s
+        opposite_polarity = (
+            (ref_amp > 0 and local_min < 0)
+            or (ref_amp < 0 and local_min > 0)
+            or c_height > ref_height * 0.03
+        )
+        if opposite_polarity and c_slope >= ref_slope * scale * 0.30:
+            q_idx = local_min_idx
+
+    # ── S peak (after R) ─────────────────────────────────────────────────────
+    s_idx: Optional[int] = None
+    s_scan_start = min(r_peak + 3, len(signal) - 1)
+    s_scan_end   = min(win_end, r_peak + max_space_samp, len(signal) - 1)
+    if s_scan_end > s_scan_start:
+        local_min = float(signal[s_scan_start])
+        local_min_idx = s_scan_start
+        for k in range(s_scan_start, s_scan_end):
+            if float(signal[k]) < local_min:
+                local_min = float(signal[k])
+                local_min_idx = k
+        c_height = abs(local_min)
+        scale    = c_height / ref_height if ref_height > 1e-9 else 0.0
+        c_slope  = 0.0
+        slope_scan_start = max(r_peak, local_min_idx - 5)
+        for k in range(slope_scan_start, local_min_idx):
+            if k + 1 < len(signal):
+                s = abs(float(signal[k + 1]) - float(signal[k]))
+                if s > c_slope:
+                    c_slope = s
+        opposite_polarity = (
+            (ref_amp > 0 and local_min < 0)
+            or (ref_amp < 0 and local_min > 0)
+            or c_height > ref_height * 0.03
+        )
+        if opposite_polarity and c_slope >= ref_slope * scale * 0.30:
+            s_idx = local_min_idx
+
+    return q_idx, s_idx
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CONVENIENCE WRAPPER (raw signal, per-beat use)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _kotlin_qrs_window_samples(rr_ms: float, fs: float) -> Tuple[int, int]:
+    """ECGAnalyzer.kt curtinBuildWindows() PR/QT approximation in samples."""
+    median_rr_sec = float(rr_ms) / 1000.0 if rr_ms and rr_ms > 0 else 0.8
+    clamped_rr = float(np.clip(median_rr_sec, 60.0 / 120.0, 60.0 / 40.0))
+    pr_sec = -0.1195 + 0.5170 * np.sqrt(clamped_rr) - 0.2199 * clamped_rr
+    pr_sec = float(np.clip(pr_sec, 0.08, 0.30))
+    qt_sec = 0.38 * np.sqrt(clamped_rr)
+    qt_sec = float(np.clip(qt_sec, 0.24, 0.60))
+    return int(pr_sec * fs), int(qt_sec * fs)
+
+
+def _kotlin_qrs_max_ms(local_hr: int) -> int:
+    if local_hr < 60:
+        return 200
+    if local_hr <= 100:
+        return 200
+    if local_hr <= 150:
+        return 180
+    return 160
+
 
 def qrs_duration_from_raw_signal(lead_data: np.ndarray,
                                   r_curr_idx: int,
                                   fs: float = 500.0,
                                   adc_per_mv: float = 1200.0,
-                                  heart_rate: int = 75
+                                  heart_rate: int = 75,
+                                  rr_ms: Optional[float] = None
                                   ) -> float:
-    """Per-beat QRS duration from raw signal around known R-peak. HR-adaptive."""
-    # ── Two-pass adaptive QRS border search ─────────────────────────────
-    # Pass 1: narrow window (±80ms) — correct for normal QRS (< 120ms).
-    # Pass 2: wider window — only triggered when the QRS offset reaches the
-    # edge of the narrow segment, indicating the complex extends further.
-    # Normal beats stop well inside; BBB beats hit the boundary.
+    """Per-beat QRS duration using the ECGAnalyzer.kt Curtin 2018 flow.
 
-    if heart_rate >= 150: slope_mul = 1.30
-    elif heart_rate >= 120: slope_mul = 1.08
-    elif heart_rate >= 75:  slope_mul = 1.10
-    else:                   slope_mul = 2.20
+    The R peak is supplied by Kotlin-style Pan-Tompkins. Around that peak we
+    build the same RR-derived Curtin window used by ECGAnalyzer.kt, find Q/S
+    significant peaks, delineate borders on the full lead so the TP baseline is
+    available, then apply the same HR-specific QRS duration acceptance caps.
+    """
+    sig = np.asarray(lead_data, dtype=float)
+    if sig.size < 20 or fs <= 0:
+        return 0.0
 
-    def _measure(pre_ms_loc, post_ms_loc):
-        ws = max(0, r_curr_idx - int(pre_ms_loc / 1000.0 * fs))
-        we = min(len(lead_data), r_curr_idx + int(post_ms_loc / 1000.0 * fs))
-        seg = np.array(lead_data[ws:we], dtype=float)
-        if len(seg) < 20:
-            return 0.0, seg, None
-        bl = min(len(seg), int(0.03 * fs))
-        seg -= float(np.mean(seg[:max(1, bl)]))
-        rp = find_reference_peak(seg, 0, len(seg))
-        if abs(seg[rp]) < 1e-9:
-            return 0.0, seg, None
-        sp_loc = find_significant_peaks(seg, rp, 0, len(seg), fs)
-        sp_loc = remove_peak_outliers_by_spacing(sp_loc, fs)
-        if not sp_loc:
-            return 0.0, seg, None
-        r_peak_amp = abs(seg[rp])
-        effective_adc = max(r_peak_amp, adc_per_mv / 5.0)
-        on, off = delineate_channel_borders(seg, sp_loc, rp, 0, len(seg), fs, effective_adc * slope_mul)
-        if on is None or off is None:
-            return 0.0, seg, None
-        ms = (off - on) / fs * 1000.0
-        amp_ms, _, _ = _adaptive_amplitude_qrs_width(
-            seg,
-            rp,
-            fs,
-            baseline_ratio=0.10,
-            wide_ratio=0.05,
-            pre_ms=250.0,
-            post_ms=400.0,
-        )
-        ms = max(ms, amp_ms)
-        result = round(ms, 1) if QRS_DURATION_MIN_MS <= ms <= QRS_DURATION_MAX_MS else 0.0
-        return result, seg, off
+    r_curr_idx = int(max(0, min(sig.size - 1, r_curr_idx)))
+    local_hr = int(np.clip(int(round(heart_rate or 75)), 30, 300))
+    local_rr_ms = float(rr_ms) if rr_ms and rr_ms > 0 else 60000.0 / max(local_hr, 1)
+    pre_samp, post_samp = _kotlin_qrs_window_samples(local_rr_ms, fs)
 
-    # Pass 1 — narrow (±80ms)
-    qrs_ms, seg1, off1 = _measure(80.0, 80.0)
+    win_start = max(0, r_curr_idx - pre_samp)
+    win_end = min(sig.size, r_curr_idx + post_samp + 1)
+    if win_end - win_start < 20 or abs(float(sig[r_curr_idx])) < 1e-9:
+        return 0.0
 
-    # BBB discriminator: offset clips the segment edge → complex continues beyond window
-    # Normal beats stop well inside (off1 <= len-4); BBB beats hit the last samples.
-    hits_boundary = off1 is not None and len(seg1) > 0 and off1 >= len(seg1) - 3
+    local_extrema = _find_local_extrema(sig, win_start, win_end)
+    raw_candidates = sorted(set([r_curr_idx] + local_extrema))
+    validated = _curtin_validate_peaks(sig, raw_candidates, fs)
+    if validated and r_curr_idx not in validated:
+        nearest = min(validated, key=lambda p: abs(int(p) - r_curr_idx))
+        if abs(nearest - r_curr_idx) <= int(0.04 * fs):
+            r_curr_idx = int(nearest)
 
-    # Pass 2 — wide (120ms pre / 160ms post), only when complex extends beyond narrow window
-    if hits_boundary:
-        qrs_ms_wide, _, _ = _measure(120.0, 160.0)
-        if qrs_ms_wide > 0:
-            qrs_ms = qrs_ms_wide
-
-    qrs_ms_amp, _, _ = _amplitude_qrs_width(
-        np.asarray(lead_data, dtype=float),
-        r_curr_idx,
-        fs,
-        threshold_ratio=0.10,
-        pre_ms=250.0,
-        post_ms=400.0,
+    q_idx, s_idx = _curtin_find_q_s_peaks(sig, r_curr_idx, win_start, win_end, fs)
+    significant = [r_curr_idx] + [p for p in (q_idx, s_idx) if p is not None]
+    significant = sorted(set(significant))
+    significant = remove_peak_outliers_by_spacing(
+        significant, fs, max_spacing_ms=_CURTIN_MAX_SIG_PEAK_MS
     )
-    if qrs_ms_amp > qrs_ms:
-        qrs_ms = qrs_ms_amp
+    if not significant:
+        return 0.0
 
-    return qrs_ms
+    r_peak_amp = abs(float(sig[r_curr_idx]))
+    effective_adc = max(r_peak_amp, adc_per_mv / 5.0)
+    onset, offset = delineate_channel_borders(
+        sig, significant, r_curr_idx, win_start, win_end, fs, effective_adc
+    )
+    if onset is None or offset is None:
+        return 0.0
+
+    duration_ms = (offset - onset) * 1000.0 / fs
+    min_qrs = 40.0
+    max_qrs = float(_kotlin_qrs_max_ms(local_hr))
+    if min_qrs <= duration_ms <= max_qrs:
+        return round(float(duration_ms), 1)
+
+    # If the baseline/offset scan runs wide, keep the Curtin significant Q/S
+    # span as the conservative complex boundary before applying relaxed caps.
+    qs_onset = max(win_start, significant[0] - int(0.01 * fs))
+    qs_offset = min(win_end - 1, significant[-1] + int(0.01 * fs))
+    qs_ms = (qs_offset - qs_onset) * 1000.0 / fs
+    if min_qrs <= qs_ms <= max_qrs:
+        return round(float(qs_ms), 1)
+
+    if (min_qrs - 10.0) <= duration_ms <= (max_qrs + 30.0):
+        return round(float(duration_ms), 1)
+    return 0.0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # SELF-TEST
 # ══════════════════════════════════════════════════════════════════════════════
 

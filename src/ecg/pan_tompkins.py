@@ -1,127 +1,85 @@
 import numpy as np
 from scipy.signal import butter, filtfilt
 
+
+def _moving_average_kotlin(signal: np.ndarray, window_size: int) -> np.ndarray:
+    """Moving average with the same left padding used by ECGAnalyzer.kt."""
+    x = np.asarray(signal, dtype=float)
+    if window_size <= 1 or x.size < window_size:
+        return x.copy()
+
+    result = []
+    current_sum = float(np.sum(x[:window_size]))
+    result.append(current_sum / float(window_size))
+    for i in range(window_size, x.size):
+        current_sum += float(x[i]) - float(x[i - window_size])
+        result.append(current_sum / float(window_size))
+
+    padding = [result[0]] * (window_size - 1)
+    return np.asarray(padding + result, dtype=float)
+
+
+def _pt_bandpass_filter(signal: np.ndarray, fs: float) -> np.ndarray:
+    nyq = 0.5 * float(fs)
+    low = max(5.0 / nyq, 0.001)
+    high = min(15.0 / nyq, 0.99)
+    if not np.isfinite(low) or not np.isfinite(high) or low <= 0 or high >= 1 or low >= high:
+        return signal
+    b, a = butter(2, [low, high], btype="band")
+    try:
+        if len(signal) < max(len(a), len(b)) * 3:
+            from scipy.signal import lfilter
+            return lfilter(b, a, signal)
+        return filtfilt(b, a, signal)
+    except Exception:
+        return signal
+
+
 def pan_tompkins(ecg, fs=500):
     """
-    Pan-Tompkins QRS detection algorithm implementation.
-    Args:
-        ecg: 1D numpy array of ECG signal
-        fs: Sampling frequency (Hz)
-    Returns:
-        r_peaks: Indices of detected R peaks (aligned to the bandpassed ECG,
-                 not the integrated envelope).
+    Pan-Tompkins R-peak detection matching ECGAnalyzer.kt.
+
+    Pipeline:
+      5-15 Hz bandpass -> derivative -> square -> 100 ms moving average
+      -> threshold = integrated.average() * 1.5 -> 200 ms refractory
+      -> true R index = max source-signal sample within +/- 50 ms.
     """
-    # 1. Bandpass filter (5-15 Hz) — classic QRS band.
-    # Use filtfilt (zero-phase) so peak indices are not delayed by IIR phase shift.
-    def bandpass_filter(signal, lowcut, highcut, fs, order=2):
-        nyq = 0.5 * fs
-        low = max(lowcut / nyq, 0.001)
-        high = min(highcut / nyq, 0.99)
-        if not np.isfinite(low) or not np.isfinite(high) or low <= 0 or high >= 1 or low >= high:
-            return signal
-        b, a = butter(order, [low, high], btype='band')
-        # If signal is too short for filtfilt padding, fall back to causal filtering
-        try:
-            if len(signal) < max(len(a), len(b)) * 3:
-                from scipy.signal import lfilter
-                return lfilter(b, a, signal)
-            return filtfilt(b, a, signal)
-        except Exception:
-            return signal
-
     x = np.asarray(ecg, dtype=float)
-    if x.size < 10 or not np.isfinite(fs) or fs <= 0:
+    if x.size < int(fs) or not np.isfinite(fs) or fs <= 0:
         return np.array([], dtype=int)
 
-    filtered = bandpass_filter(x, 5, 15, fs)
-    # 2. Differentiate
-    diff = np.ediff1d(filtered, to_end=0.0)
-    # 3. Square
-    squared = diff ** 2
-    # 4. Moving window integration (150 ms window)
-    window_size = max(1, int(round(0.15 * fs)))
-    if window_size > squared.size:
-        window_size = max(1, squared.size // 4)
-    mwa = np.convolve(squared, np.ones(window_size) / float(window_size), mode='same')
+    bp_filtered = _pt_bandpass_filter(x, float(fs))
+    derivative = np.diff(bp_filtered)
+    squared = derivative ** 2
 
-    # 5. Find peaks (adaptive threshold with fallbacks)
-    from scipy.signal import find_peaks
-
-    # FIX-PT1: Adaptive refractory period — prevents T-wave double-detection.
-    # FIX-PT2: Was 0.20*fs (200ms) = exactly RR at 300 BPM → find_peaks
-    # missed every other peak → false 150 BPM.
-    # Now 0.16*fs (160ms at 500Hz = 80 samples) → supports up to ~375 BPM.
-    # Pass-2 below still adapts refractory for low HR to kill T-wave ghosts.
-    min_distance = max(1, int(round(0.22 * fs)))
-    mean_mwa = float(np.mean(mwa)) if mwa.size else 0.0
-    std_mwa = float(np.std(mwa)) if mwa.size else 0.0
-
-    peaks = np.array([], dtype=int)
-    for k in (0.50, 0.30, 0.15, 0.10):
-        thr = mean_mwa + k * std_mwa
-        try:
-            peaks, _ = find_peaks(mwa, height=thr, distance=min_distance)
-        except Exception:
-            peaks = np.array([], dtype=int)
-        if peaks.size >= 2:
-            break
-
-    # FIX-PT1 continued: if HR looks < 100 BPM, rerun with tighter refractory
-    # to kill T-wave false peaks that appear at ~0.33*RR after true R.
-    if peaks.size >= 3:
-        ipi = np.diff(peaks) / fs * 1000.0  # inter-peak intervals in ms
-        median_ipi = float(np.median(ipi))
-        if median_ipi > 600:  # HR < 100 BPM
-            adaptive_refrac = max(int(round(0.22 * fs)),
-                                  int(round(0.33 * median_ipi / 1000.0 * fs)))
-            if adaptive_refrac > min_distance:
-                min_distance = adaptive_refrac
-                peaks = np.array([], dtype=int)
-                for k in (0.50, 0.30, 0.15, 0.10):
-                    thr = mean_mwa + k * std_mwa
-                    try:
-                        peaks, _ = find_peaks(mwa, height=thr, distance=min_distance)
-                    except Exception:
-                        peaks = np.array([], dtype=int)
-                    if peaks.size >= 2:
-                        break
-
-    if peaks.size == 0:
+    window_size = max(1, int(float(fs)) // 10)
+    integrated = _moving_average_kotlin(squared, window_size)
+    if integrated.size < (2 * window_size + 1):
         return np.array([], dtype=int)
 
-    # 6. Search-back: map each envelope peak to the true R-peak location
-    # by finding max(|bandpassed ECG|) within ±75 ms.
-    search_half = max(1, int(round(0.075 * fs)))
-    r_locs = []
-    for p in peaks:
-        left = max(0, int(p) - search_half)
-        right = min(filtered.size, int(p) + search_half + 1)
-        if right <= left:
-            continue
-        seg = filtered[left:right]
-        # Use abs() to handle inverted leads (R can be negative)
-        r = left + int(np.argmax(np.abs(seg)))
-        r_locs.append(r)
-
-    if not r_locs:
+    threshold = float(np.mean(integrated)) * 1.5
+    signal_amplitude = float(np.max(x) - np.min(x))
+    if signal_amplitude < 0.08:
         return np.array([], dtype=int)
 
-    r_locs = np.array(sorted(set(r_locs)), dtype=int)
+    refractory_period = max(1, int(float(fs) * 0.2))
+    peaks = []
+    i = window_size
+    while i < integrated.size - window_size:
+        if (
+            integrated[i] > threshold
+            and integrated[i] > integrated[i - 1]
+            and integrated[i] > integrated[i + 1]
+        ):
+            search_start = max(0, i - window_size // 2)
+            search_end = min(x.size - 1, i + window_size // 2)
+            peak_idx = search_start + int(np.argmax(x[search_start:search_end + 1]))
+            if not peaks or peak_idx - peaks[-1] > refractory_period:
+                peaks.append(int(peak_idx))
+            i += window_size
+        i += 1
 
-    # 7. De-duplicate R-peaks within refractory period: keep the larger |amplitude|
-    dedup = []
-    for r in r_locs:
-        if not dedup:
-            dedup.append(int(r))
-            continue
-        if int(r) - dedup[-1] < min_distance:
-            prev = dedup[-1]
-            if abs(filtered[int(r)]) > abs(filtered[int(prev)]):
-                dedup[-1] = int(r)
-        else:
-            dedup.append(int(r))
-
-    return np.array(dedup, dtype=int)
+    return np.asarray(peaks, dtype=int)
 
 
 def detectRPeaks(filtered_signal, fs=500):

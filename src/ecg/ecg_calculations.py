@@ -59,7 +59,14 @@ from scipy.signal import butter, filtfilt, find_peaks
 
 # ── Internal imports ──────────────────────────────────────────────────────────
 from .signal_paths import display_filter
-from .qrs_detection import qrs_duration_from_raw_signal
+from .qrs_detection import (
+    qrs_duration_from_raw_signal,
+    _curtin_validate_peaks,       # Curtin 2018 §2b-§2d peak validation
+    _curtin_find_q_s_peaks,       # Curtin 2018 §6 Q/S extended (120 ms)
+    find_significant_peaks,
+    remove_peak_outliers_by_spacing,
+    _find_local_extrema,
+)
 from .metrics.reference_intervals import lookup_reference_intervals
 from .pre_analysis import pre_analyze, should_analyze
 
@@ -271,12 +278,20 @@ def _bandpass(x: np.ndarray, fs: float) -> np.ndarray:
 # Pan-Tompkins primary + multi-strategy fallback
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def detectRPeaks(filtered_signal: np.ndarray, fs: float) -> np.ndarray:
     """
     Detect R-peaks using Pan-Tompkins (primary) with multi-strategy fallback.
 
     Implements the classic Pan-Tompkins pipeline:
       bandpass → differentiate → square → moving-average → threshold + refractory
+
+    UPGRADE (Curtin 2018 §2b-§2d integration):
+      After the primary detector returns candidate peaks, _curtin_validate_peaks()
+      applies amplitude + half-width down-selection and 81 ms intra-complex merge.
+      This removes T-wave detections, double-detections on notched QRS complexes,
+      and noise spikes that slip through Pan-Tompkins at high HR.  The fallback
+      multi-strategy path applies the same validation.
 
     Returns:
         Array of R-peak sample indices.
@@ -291,6 +306,13 @@ def detectRPeaks(filtered_signal: np.ndarray, fs: float) -> np.ndarray:
         print(f" ⚠️ Pan-Tompkins failed: {e}")
 
     if len(peaks) >= 2:
+        # Curtin §2b-§2d validation to clean up T-waves and double-detections
+        try:
+            validated = _curtin_validate_peaks(filtered_signal, peaks.tolist(), fs)
+            if len(validated) >= 2:
+                return np.array(sorted(validated), dtype=int)
+        except Exception:
+            pass
         return peaks
 
     # Fallback: multi-strategy find_peaks
@@ -334,7 +356,16 @@ def detectRPeaks(filtered_signal: np.ndarray, fs: float) -> np.ndarray:
 
     candidates = stable if stable else detection_results
     candidates.sort(key=lambda x: x[2], reverse=True)
-    return candidates[0][1]
+    best_peaks = candidates[0][1]
+
+    # Curtin §2b-§2d validation on fallback result too
+    try:
+        validated = _curtin_validate_peaks(filtered_signal, best_peaks.tolist(), fs)
+        if len(validated) >= 2:
+            return np.array(sorted(validated), dtype=int)
+    except Exception:
+        pass
+    return best_peaks
 
 
 # keep internal alias
@@ -1094,7 +1125,7 @@ def calculate_all_ecg_metrics(
 
         try:
             qrs_dur_ms  = qrs_duration_from_raw_signal(
-                filt, r_curr_idx, fs, adc_per_mv=1200.0, heart_rate=hr
+                filt, r_curr_idx, fs, adc_per_mv=1200.0, heart_rate=hr, rr_ms=rr_ms
             )
             qrs_dur_int = int(round(qrs_dur_ms)) if qrs_dur_ms > 0 else 0
         except Exception:
