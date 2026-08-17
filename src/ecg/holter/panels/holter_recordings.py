@@ -40,7 +40,7 @@ from ..holter_helpers import (
     UI_SUCCESS, UI_TEXT, UI_WARNING, _class_matches_filter, _find_latest_completed_session,
     _format_system_time, _get_recording_start_end_times, _metrics_duration_sec,
     _normalize_beat_class, _normalize_patient_info, _resolve_recordings_dir, _sec_to_hms,
-    _style_active_btn, _style_btn, _table_style, _template_filter_key,
+    _show_message_box, _style_active_btn, _style_btn, _table_style, _template_filter_key,
 )
 
 from .holter_widgets import ECGStripCanvas, HistogramCanvas, LorenzCanvas, MagnifierOverlay, STCanvas, STTMarkerCanvas

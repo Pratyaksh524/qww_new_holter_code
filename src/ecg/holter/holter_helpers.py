@@ -7,6 +7,8 @@ import os
 from datetime import datetime
 from typing import Optional
 
+from PyQt5.QtWidgets import QMessageBox
+
 from .theme import (
     COL_BLACK,
     COL_BG,
@@ -292,4 +294,37 @@ def _get_recording_start_end_times(session_dir: str, duration_sec: float) -> tup
     except Exception as e:
         print(f"[HolterUI] Error reading recording start/end times: {e}")
     return "Unknown", "Unknown"
+
+
+def _show_message_box(parent, icon, title, text, buttons=QMessageBox.Ok, default_button=QMessageBox.NoButton):
+    """Display a styled QMessageBox modal dialog."""
+    msg_box = QMessageBox(parent)
+    msg_box.setIcon(icon)
+    msg_box.setWindowTitle(title)
+    msg_box.setText(text)
+    msg_box.setStandardButtons(buttons)
+    msg_box.setDefaultButton(default_button)
+    msg_box.setStyleSheet(f"""
+        QMessageBox {{
+            background-color: {UI_PANEL};
+        }}
+        QMessageBox QLabel {{
+            color: {UI_TEXT};
+            background-color: transparent;
+        }}
+        QMessageBox QPushButton {{
+            background-color: {UI_PANEL_ALT};
+            color: #FFFFFF;
+            border: 1px solid {UI_BORDER};
+            border-radius: 4px;
+            padding: 5px 15px;
+            min-width: 60px;
+        }}
+        QMessageBox QPushButton:hover {{
+            background-color: {UI_ACCENT};
+            border-color: {UI_ACCENT_HOVER};
+        }}
+    """)
+    return msg_box.exec_()
+
 

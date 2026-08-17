@@ -896,10 +896,7 @@ class ECGStripCanvas(QWidget):
         self._beat_annotations = beat_annotations or []
         self._structured_events = structured_events or []
         self._start_sec = start_sec
-        if fast_preview:
-            self._rr_intervals = []
-        else:
-            self._rr_intervals = self._calculate_rr_intervals() if beat_annotations else []
+        self._rr_intervals = self._calculate_rr_intervals() if beat_annotations else []
         self.update()
     
     def _calculate_rr_intervals(self):
@@ -939,6 +936,20 @@ class ECGStripCanvas(QWidget):
             })
         
         return intervals
+
+    def wheelEvent(self, event):
+        """Scroll time scrollbar forward/backward on mouse wheel."""
+        delta = event.angleDelta().y()
+        if delta != 0:
+            step = -1.0 if delta > 0 else 1.0  # Wheel up = scroll forward, wheel down = backward
+            parent = self.parentWidget()
+            while parent is not None:
+                if hasattr(parent, 'time_scrollbar') and parent.time_scrollbar is not None:
+                    curr_val = parent.time_scrollbar.value()
+                    # Step by 100 units (1.0 second) per wheel click
+                    parent.time_scrollbar.setValue(curr_val + int(step * 100))
+                    break
+                parent = parent.parentWidget()
 
     def mousePressEvent(self, event):
         # Let the event propagate to parent's eventFilter for vertical line handling
@@ -1467,6 +1478,98 @@ class ECGStripCanvas(QWidget):
                                 if start_idx < end_idx:
                                     colored_intervals.append((start_idx, end_idx, color))
         
+        # ------------------------------------------------------------------
+        # Auto-Detection Pattern-Specific QRS Peak Coloring
+        # ------------------------------------------------------------------
+        # Colors each auto-detected QRS peak using its EXACT badge pattern color
+        # (e.g. VT Run=#FF0000, Bigeminy=#FF6600, Couplet=#FF3333, Single PVC=#FF6666,
+        #        SVT Run=#00CCFF, PAC Bigeminy=#00FFFF, PAC Couplet=#66FFFF, Single PAC=#99FFFF)
+        #
+        # IMPORTANT: Manual beats (is_manual=True) are COMPLETELY EXCLUDED from this pass.
+        # Manual marking coloring is handled exclusively by the _structured_events loop above.
+        # ------------------------------------------------------------------
+        if not self._disable_all_coloring and hasattr(self, '_beat_annotations') and self._beat_annotations:
+            try:
+                from ecg.holter.holter_summary_calc import label_beat_sequences, _get_badge_appearance
+
+                # Manual Beat Marking QRS Peak Coloring
+                manual_label_colors = {
+                    "S": "#00FFFF",      # Supraventricular - Cyan
+                    "P": "#FF00FF",      # Premature - Magenta
+                    "V": "#FF3333",      # Ventricular - Red
+                    "C": "#FFA500",      # Conduction - Orange
+                    "T": "#9932CC",      # TV Paced - Dark Orchid (Purple)
+                    "A": "#FFFF00",      # ACLS - Yellow
+                    "X": "#0000FF",      # Artifact - Blue
+                }
+
+                for beat in self._beat_annotations:
+                    if beat.get('is_manual', False):
+                        lbl = str(beat.get('label', 'N')).upper()
+                        code = lbl.split('(')[1].split(')')[0] if ('(' in lbl and ')' in lbl) else lbl
+                        code = beat.get('short_code', code)
+
+                        if code in ('N', ''):
+                            continue
+
+                        color = beat.get('color') or manual_label_colors.get(code, "#FFFF00")
+                        if not color or color.upper() in ('#FFFFFF', '#FFF', 'WHITE', '#00FF00'):
+                            continue
+
+                        ts = float(beat.get('timestamp', 0.0))
+                        if not (self._start_sec <= ts <= end_sec):
+                            continue
+
+                        qrs_start_ts = max(self._start_sec, ts - 0.06)
+                        qrs_end_ts   = min(end_sec,          ts + 0.06)
+                        s_idx = max(0,          int((qrs_start_ts - self._start_sec) * self._fs))
+                        e_idx = min(len(d) - 1, int((qrs_end_ts   - self._start_sec) * self._fs))
+                        if s_idx < e_idx:
+                            colored_intervals.append((s_idx, e_idx, color))
+
+                # Only process auto-detected beats — never touch manual beats
+                auto_beats_for_color = [
+                    b for b in self._beat_annotations
+                    if not b.get('is_manual', False)
+                ]
+
+                if auto_beats_for_color:
+                    # Run pattern sequencing to assign rhythm_pattern (Bigeminy, Couplet, VT Run etc.)
+                    # Safe to call multiple times — idempotent operation
+                    label_beat_sequences(auto_beats_for_color)
+
+                    for beat in auto_beats_for_color:
+                        # Get short code: V, S, AF, P  (skip N — no coloring needed)
+                        lbl = str(beat.get('label', 'N')).upper()
+                        code = lbl.split('(')[1].split(')')[0] if ('(' in lbl and ')' in lbl) else lbl
+                        # Also check short_code if already set by reclassifier
+                        code = beat.get('short_code', code)
+
+                        if code not in ('V', 'S', 'AF', 'P'):
+                            continue
+
+                        pattern = beat.get('rhythm_pattern', '')
+                        # Get the pattern-specific color (granular: Bigeminy vs Couplet vs Single)
+                        color, _ = _get_badge_appearance(code, pattern, beat)
+
+                        # Skip white / normal / suppressed colors
+                        if not color or color.upper() in ('#FFFFFF', '#FFF', 'WHITE'):
+                            continue
+
+                        ts = float(beat.get('timestamp', 0.0))
+                        if not (self._start_sec <= ts <= end_sec):
+                            continue
+
+                        # ±60 ms window centered on R-peak
+                        qrs_start_ts = max(self._start_sec, ts - 0.06)
+                        qrs_end_ts   = min(end_sec,          ts + 0.06)
+                        s_idx = max(0,          int((qrs_start_ts - self._start_sec) * self._fs))
+                        e_idx = min(len(d) - 1, int((qrs_end_ts   - self._start_sec) * self._fs))
+                        if s_idx < e_idx:
+                            colored_intervals.append((s_idx, e_idx, color))
+
+            except Exception as _exc:
+                pass   # Never crash paint — coloring is decorative
 
         colored_intervals.sort(key=lambda x: x[0])
         

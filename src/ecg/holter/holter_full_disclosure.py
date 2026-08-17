@@ -2854,8 +2854,7 @@ class HolterFullDisclosureDialog(QDialog):
         # frame; the arrhythmia/event label rebuild involves gathering and
         # sorting events and is gated by update_extras (see _process_scroll_update).
         self.lbl_time.setText(f"Time:  {self._engine._sec_to_hms(start_sec)}")
-        if update_extras:
-            self._update_time_and_arrhythmia_labels(start_sec, end_sec)
+        self._update_time_and_arrhythmia_labels(start_sec, end_sec)
 
         read_end_sec = min(end_sec, eff_dur)
         
