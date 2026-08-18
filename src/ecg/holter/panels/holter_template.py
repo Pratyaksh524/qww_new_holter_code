@@ -223,6 +223,17 @@ class TemplateCardWidget(QFrame):
             except Exception:
                 pass
 
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            if watched not in (self.id_edit, self.class_combo, self.view_toggle):
+                self.clicked.emit(self, event)
+                return False
+        elif event.type() == QEvent.MouseButtonDblClick and event.button() == Qt.LeftButton:
+            if watched not in (self.id_edit, self.class_combo, self.view_toggle):
+                self.double_clicked.emit(self)
+                return True
+        return super().eventFilter(watched, event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked.emit(self, event)
@@ -436,6 +447,8 @@ class HolterBeatTemplatePanel(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._scroll.setStyleSheet(f"QScrollArea{{background:{COL_BG};border:none;}}")
         self._cards_host = QWidget()
         self._cards_host.setStyleSheet(f"background:{COL_BG};")
@@ -474,9 +487,9 @@ class HolterBeatTemplatePanel(QWidget):
             info_layout.addStretch()
             flayout.addWidget(info)
 
-            canvas = ECGStripCanvas(height=60, color=COL_GREEN, pen_width=1.0, lead_name=lead_name, show_annotations=True)
+            canvas = ECGStripCanvas(height=60, color=COL_GREEN, pen_width=1.0, lead_name=lead_name, show_vertical_lines=False, show_annotations=True, show_rr_numbers=False, disable_all_coloring=False)
             canvas.set_paper_speed(25)
-            canvas.set_gain(1.0)
+            canvas.set_gain(1.5)
             flayout.addWidget(canvas, 1)
 
             self._detail_layout.addWidget(frame, i // 3, i % 3)
@@ -1020,13 +1033,31 @@ class HolterBeatTemplatePanel(QWidget):
         # Load all 12 leads for this template
         self._update_detail_grid(template_key)
 
+    def _get_replay_engine(self):
+        if self._replay_engine is not None:
+            return self._replay_engine
+        win = self.window()
+        if win is not None and getattr(win, "_replay_engine", None) is not None:
+            self._replay_engine = win._replay_engine
+            return self._replay_engine
+        parent = self.parentWidget()
+        while parent is not None:
+            if getattr(parent, "_replay_engine", None) is not None:
+                self._replay_engine = parent._replay_engine
+                return self._replay_engine
+            parent = parent.parentWidget()
+        return None
+
     def _update_detail_grid(self, template_key: str):
-        if not hasattr(self, "_detail_canvases") or not self._replay_engine:
+        if not hasattr(self, "_detail_canvases"):
             return
 
         row = self._row_for_key(template_key)
+        if row is None and self._template_rows:
+            row = self._template_rows[0]
+
         label = "N"
-        first_ts = None
+        first_ts = 0.0
         rr_med   = 0.0
         qrs_med  = 0.0
         if row:
@@ -1037,64 +1068,57 @@ class HolterBeatTemplatePanel(QWidget):
             rr_med    = float(np.median(rr_list))  if rr_list  else 0.0
             qrs_med   = float(np.median(qrs_list)) if qrs_list else 0.0
 
-        # Clear canvases
-        for item in self._detail_canvases:
-            item["canvas"].set_data([], [])
-            item["type"].setText(item["lead_name"])
-
-        if first_ts is None:
-            return
-
-        engine = self._replay_engine
-
-        # --- Read a single-beat window, mirroring _resolve_template_waveform exactly ---
-        pre  = 0.18
-        post = 0.34
+        engine = self._get_replay_engine()
+        data   = None
+        n_real = 0
+        pre    = 0.60
+        post   = 0.90
         t_start = max(0.0, first_ts - pre)
-        t_end   = min(float(engine.duration_sec), first_ts + post)
-        data    = None
-        n_real  = 0
 
-        try:
-            raw_data = engine._reader.read_range(t_start, t_end)
-            if (isinstance(raw_data, np.ndarray)
-                    and raw_data.ndim == 2
-                    and raw_data.shape[0] >= 1
-                    and raw_data.shape[1] > 8):
-                data   = raw_data
-                n_real = data.shape[0]
-                print(f"[12-lead] data.shape={data.shape}  first_ts={first_ts:.3f}")
-        except Exception as e:
-            print(f"[12-lead] read_range error: {e}")
+        if engine is not None and hasattr(engine, "_reader") and engine._reader is not None:
+            try:
+                t_end = min(float(engine.duration_sec), first_ts + post)
+                raw_data = engine._reader.read_range(t_start, t_end)
+                if (isinstance(raw_data, np.ndarray)
+                        and raw_data.ndim == 2
+                        and raw_data.shape[0] >= 1
+                        and raw_data.shape[1] > 10):
+                    data   = raw_data
+                    n_real = data.shape[0]
+            except Exception as e:
+                print(f"[12-lead] read_range error: {e}")
 
-        beat_annotations = [{"timestamp": first_ts, "label": label, "type": "beat"}]
-        x_out = np.linspace(0.0, pre + post, 240)
+        beat_annotations = [{"timestamp": first_ts, "label": label, "short_code": label, "type": "beat"}]
 
         for i, item in enumerate(self._detail_canvases):
             canvas = item["canvas"]
-            waveform = None
+            canvas.set_gain(1.5)
 
             if data is not None and i < n_real:
-                # ---- exact copy of _resolve_template_waveform normalization ----
                 lead_raw = np.asarray(data[i], dtype=float)
-                baseline = float(np.median(lead_raw))
-                centered = lead_raw - baseline
-                if np.ptp(centered) > 1.0:
-                    x_old    = np.linspace(0.0, 1.0, centered.size)
-                    x_new    = np.linspace(0.0, 1.0, 240)
-                    centered = np.interp(x_new, x_old, centered)
-                    centered = centered - float(np.median(centered))
-                    peak     = max(float(np.max(np.abs(centered))), 1.0)
-                    centered = np.clip(centered / peak * 420.0, -650.0, 650.0)
-                    waveform = 2048.0 + centered
+                n_pts = len(lead_raw)
+                x = np.arange(n_pts, dtype=float) / 500.0
+                canvas.set_data(x, lead_raw,
+                                beat_annotations=beat_annotations,
+                                start_sec=t_start)
+            else:
+                synthetic = self._make_thumbnail_waveform(rr_med, qrs_med)
+                lead_name = item.get("lead_name", "")
+                if lead_name == "aVR":
+                    lead_wave = 2048.0 - (synthetic - 2048.0) * 0.8
+                elif lead_name in ("III", "aVL"):
+                    lead_wave = 2048.0 + (synthetic - 2048.0) * 0.65
+                elif lead_name in ("V1", "V2"):
+                    lead_wave = 2048.0 + (synthetic - 2048.0) * 0.85
+                elif lead_name in ("V3", "V4", "V5"):
+                    lead_wave = 2048.0 + (synthetic - 2048.0) * 1.3
+                else:
+                    lead_wave = synthetic
+                x = np.arange(len(lead_wave), dtype=float) / 500.0
+                canvas.set_data(x, lead_wave,
+                                beat_annotations=beat_annotations,
+                                start_sec=t_start)
 
-            if waveform is None:
-                # fall back to the same synthetic waveform as the card thumbnail
-                waveform = self._make_thumbnail_waveform(rr_med, qrs_med)
-
-            canvas.set_data(x_out, waveform,
-                            beat_annotations=beat_annotations,
-                            start_sec=t_start)
             item["type"].setText(f"{item['lead_name']}  {label}")
 
 
@@ -1158,8 +1182,8 @@ class HolterBeatTemplatePanel(QWidget):
                     "waveform": waveform,
                 })
                 card.set_selected(template_key in set(self._selected_template_keys))
-                row_idx = idx % 3
-                col_idx = idx // 3
+                row_idx = idx
+                col_idx = 0
                 self._cards_layout.addWidget(card, row_idx, col_idx)
                 self._card_widgets.append(card)
             
@@ -1179,10 +1203,10 @@ class HolterBeatTemplatePanel(QWidget):
             waveform = None
             engine = getattr(self, "_replay_engine", None)
             try:
-                if engine is not None and hasattr(engine, "_reader"):
+                if engine is not None and hasattr(engine, "_reader") and engine._reader is not None:
                     fs = float(getattr(engine, "fs", 500.0) or 500.0)
-                    pre = 0.18
-                    post = 0.34
+                    pre = 0.35
+                    post = 0.55
                     data = engine._reader.read_range(max(0.0, first_ts - pre), min(float(engine.duration_sec), first_ts + post))
                     if isinstance(data, np.ndarray) and data.ndim == 2 and data.shape[0] > 1 and data.shape[1] > 8:
                         lead = np.asarray(data[1], dtype=float)
@@ -1190,11 +1214,11 @@ class HolterBeatTemplatePanel(QWidget):
                         centered = lead - baseline
                         if np.ptp(centered) > 1.0:
                             x_old = np.linspace(0.0, 1.0, centered.size)
-                            x_new = np.linspace(0.0, 1.0, 240)
+                            x_new = np.linspace(0.0, 1.0, 300)
                             centered = np.interp(x_new, x_old, centered)
                             centered = centered - float(np.median(centered))
                             peak = max(float(np.max(np.abs(centered))), 1.0)
-                            centered = np.clip(centered / peak * 420.0, -650.0, 650.0)
+                            centered = np.clip(centered / peak * 1400.0, -1800.0, 1800.0)
                             waveform = 2048.0 + centered
             except Exception:
                 waveform = None
@@ -1207,7 +1231,7 @@ class HolterBeatTemplatePanel(QWidget):
             return self._make_thumbnail_waveform(rr_ms, qrs_ms)
 
     def _make_thumbnail_waveform(self, rr_ms: float, qrs_ms: float):
-        t = np.linspace(0, 1.2, 240)
+        t = np.linspace(0, 1.2, 300)
         rr_scale = np.clip(rr_ms / 900.0, 0.55, 1.8) if rr_ms > 0 else 1.0
         qrs_scale = np.clip(qrs_ms / 80.0, 0.6, 1.8) if qrs_ms > 0 else 1.0
         p = 0.04 * np.exp(-((t - 0.14) / 0.028) ** 2)
@@ -1217,7 +1241,7 @@ class HolterBeatTemplatePanel(QWidget):
         tw = 0.22 * np.exp(-((t - 0.63) / (0.09 * rr_scale)) ** 2)
         st = 0.025 * np.exp(-((t - 0.45) / 0.05) ** 2)
         wave = p + q + r + s + tw + st
-        return 2048.0 + wave * 480.0
+        return 2048.0 + wave * 1200.0
 
     def _on_template_clicked(self, row, _col):
         if 0 <= row < len(self._template_rows):

@@ -2735,18 +2735,53 @@ def main():
         
         def on_socket_ready_read(socket):
             """Process incoming message from another instance"""
-            if socket.readAll() == b"RESTORE":
-                # Find the main window from top-level widgets
+            data = socket.readAll()
+            if b"RESTORE" in data:
                 from PyQt5.QtWidgets import QApplication
-                for widget in QApplication.topLevelWidgets():
-                    if widget.isVisible() and not widget.isWindowType():
-                        continue
-                    # Restore the first visible top-level window (usually the main window)
-                    if widget.isWindow() and widget.objectName() != "UpdateBanner":
-                        widget.showNormal()
-                        widget.raise_()
-                        widget.activateWindow()
-                        break
+                from PyQt5.QtCore import Qt, QTimer
+
+                def _do_restore():
+                    main_win = None
+                    for widget in QApplication.topLevelWidgets():
+                        if not widget.isWindow() or widget.isHidden():
+                            continue
+                        if widget.objectName() in ["UpdateBanner", "LoadingOverlayDialog"]:
+                            continue
+                        main_win = widget
+                        if widget.__class__.__name__ in ["Dashboard", "DashboardWindow", "LoginRegisterDialog"]:
+                            break
+
+                    if main_win:
+                        # 1. Un-minimize / restore window state
+                        if main_win.isMinimized():
+                            if (main_win.windowState() & Qt.WindowMaximized) or main_win.__class__.__name__ == "Dashboard":
+                                main_win.showMaximized()
+                            else:
+                                main_win.showNormal()
+                        else:
+                            if main_win.__class__.__name__ == "Dashboard":
+                                main_win.showMaximized()
+                            else:
+                                main_win.show()
+
+                        main_win.raise_()
+                        main_win.activateWindow()
+
+                        # 2. Windows foreground activation bypass
+                        if sys.platform == "win32":
+                            try:
+                                import ctypes
+                                hwnd = int(main_win.winId())
+                                if main_win.isMaximized():
+                                    ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_SHOWMAXIMIZED (3)
+                                else:
+                                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE (9)
+                                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                            except Exception as e:
+                                print(f"[MainApp] Error bringing window to front via win32: {e}")
+
+                QTimer.singleShot(0, _do_restore)
+
             socket.disconnectFromServer()
             socket.deleteLater()
         

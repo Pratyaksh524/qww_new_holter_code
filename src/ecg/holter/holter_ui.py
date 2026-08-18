@@ -1907,6 +1907,11 @@ class HolterMainWindow(QDialog):
             self._events_panel.set_session_dir(self.session_dir)
             self._events_panel.load_events(events, self._summary)
         if hasattr(self, '_template_panel'):
+            if self._replay_engine:
+                try:
+                    self._template_panel.set_replay_engine(self._replay_engine)
+                except Exception:
+                    pass
             self._template_panel.update_from_metrics(self._metrics_list, self._summary)
         if hasattr(self, '_edit_event_panel'):
             self._edit_event_panel.set_session_dir(self.session_dir)
@@ -2138,6 +2143,11 @@ class HolterMainWindow(QDialog):
             except Exception:
                 pass
             self._replay_panel.seek_requested.connect(self._on_seek_requested)
+        if hasattr(self, '_template_panel') and getattr(self, '_replay_engine', None):
+            try:
+                self._template_panel.set_replay_engine(self._replay_engine)
+            except Exception:
+                pass
         self._refresh_ui()
         if hasattr(self, '_tabs'):
             self._tabs.setCurrentIndex(0)

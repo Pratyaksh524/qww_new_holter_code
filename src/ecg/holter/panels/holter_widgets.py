@@ -762,7 +762,7 @@ class LorenzCanvas(QWidget):
 # 6b. ECG STRIP CANVAS
 class ECGStripCanvas(QWidget):
     """Simple ECG strip renderer with interactive measurement tools."""
-    def __init__(self, parent=None, height: int = 80, color: str = "#00FF00", pen_width: float = 0.7, lead_name: str = "", show_vertical_lines: bool = True, show_annotations: bool = True, disable_all_coloring: bool = False):
+    def __init__(self, parent=None, height: int = 80, color: str = "#00FF00", pen_width: float = 0.7, lead_name: str = "", show_vertical_lines: bool = True, show_annotations: bool = True, disable_all_coloring: bool = False, show_rr_numbers: bool = True):
         super().__init__(parent)
         self._data = np.zeros(200)
         self._color = color
@@ -770,7 +770,8 @@ class ECGStripCanvas(QWidget):
         self.lead_name = lead_name
         self._start_sec = 0.0
         self._show_vertical_lines = show_vertical_lines  # Control whether to show R-peak vertical lines
-        self._show_annotations = show_annotations  # Control whether to show N labels and RR numbers
+        self._show_annotations = show_annotations  # Control whether to show beat badge labels
+        self._show_rr_numbers = show_rr_numbers  # Control whether to show RR interval numbers (e.g. 476, 632)
         self._disable_all_coloring = disable_all_coloring  # CRITICAL: Disable ALL coloring (for replay/overview)
         self._gain = 1.0
         self._speed = 25
@@ -1883,7 +1884,7 @@ class ECGStripCanvas(QWidget):
                     # Box removed â€” label + time text is sufficient visual indicator
         
         # --- Draw N-N (R-R) Interval Labels ONLY on Lead I ---
-        if lead_name == 'I' and hasattr(self, '_rr_intervals') and self._rr_intervals and self._show_annotations:  # Only show if annotations enabled
+        if lead_name == 'I' and hasattr(self, '_rr_intervals') and self._rr_intervals and self._show_annotations and getattr(self, '_show_rr_numbers', True):  # Only show if annotations & rr numbers enabled
             font = painter.font()
             font.setPixelSize(9)
             font.setBold(False)

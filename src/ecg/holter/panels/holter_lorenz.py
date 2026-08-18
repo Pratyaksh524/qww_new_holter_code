@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import gc
 import json
@@ -87,15 +87,28 @@ class HolterLorenzPanel(QWidget):
         self.lorenz_canvas.setFixedHeight(350)
         l_layout.addWidget(self.lorenz_canvas)
 
-        # Single row of beat-filter buttons (same as before)
+        # Filter buttons matching the Template tab
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(3)
+        btn_row.setSpacing(4)
         self._filter_btns = {}
-        for lbl in ["All", "Normal", "S", "V", "Paced", "AF/AFl", "Other", "X", "Not including", "Search beats", "All"]:
+        self._current_filter = "all"
+        for key, lbl in [
+            ("all", "All"),
+            ("N", "N"),
+            ("S", "S"),
+            ("V", "V"),
+            ("P", "P"),
+            ("AF", "AF"),
+            ("X", "X"),
+            ("Other", "Other"),
+        ]:
             btn = QPushButton(lbl)
             btn.setCheckable(True)
-            btn.setStyleSheet(_style_btn())
-            self._filter_btns[lbl] = btn
+            btn.setChecked(key == "all")
+            btn.setToolTip(f"Filter by {lbl}")
+            btn.setStyleSheet(_style_active_btn() if key == "all" else _style_btn())
+            btn.clicked.connect(lambda checked=False, k=key: self._set_lorenz_filter(k))
+            self._filter_btns[key] = btn
             btn_row.addWidget(btn)
         l_layout.addLayout(btn_row)
 
@@ -210,14 +223,44 @@ class HolterLorenzPanel(QWidget):
             start_epoch = self._metrics_list[0].get('timestamp')
             
         self.rr_trend_canvas.set_points(pts, start_epoch)
-        
-        rr_n = [r for r, c in zip(rr_all, rr_classes) if r > 200]
-        rr_n_classes = [c for r, c in zip(rr_all, rr_classes) if r > 200]
+        self._pts = pts
+        self._rr_all = rr_all
+        self._rr_classes = rr_classes
+        self._apply_lorenz_filter()
+
+    def _set_lorenz_filter(self, key: str):
+        self._current_filter = key
+        for k, btn in self._filter_btns.items():
+            is_active = (k == key)
+            btn.setChecked(is_active)
+            btn.setStyleSheet(_style_active_btn() if is_active else _style_btn())
+        self._apply_lorenz_filter()
+
+    def _apply_lorenz_filter(self):
+        pts = getattr(self, "_pts", [])
+        rr_all = getattr(self, "_rr_all", [])
+        rr_classes = getattr(self, "_rr_classes", [])
+        filt = getattr(self, "_current_filter", "all")
+
+        if not rr_all:
+            self.lorenz_canvas.set_data([], [])
+            return
+
+        if filt == "all":
+            rr_n = [r for r, c in zip(rr_all, rr_classes) if r > 200]
+            rr_n_classes = [c for r, c in zip(rr_all, rr_classes) if r > 200]
+            rr_pts_full = [(t, r, c) for (t, r), c in zip(pts, rr_classes) if r > 200]
+        else:
+            filtered_indices = [i for i, (r, c) in enumerate(zip(rr_all, rr_classes)) if r > 200 and _class_matches_filter(c, filt)]
+            rr_n = [rr_all[i] for i in filtered_indices]
+            rr_n_classes = [rr_classes[i] for i in filtered_indices]
+            rr_pts_full = [(pts[i][0], pts[i][1], rr_classes[i]) for i in filtered_indices if i < len(pts)]
+
         if len(rr_n) >= 2:
             rr_x = rr_n[:-1]
             rr_y = rr_n[1:]
             plot_beat_classes = rr_n_classes[:-1]
-            
+
             lo = float(np.percentile(rr_n, 5))
             hi = float(np.percentile(rr_n, 95))
             if hi - lo < 250:
@@ -226,10 +269,11 @@ class HolterLorenzPanel(QWidget):
                 hi = center + 500.0
             lo = max(0.0, lo - 50.0)
             hi = hi + 50.0
-            # Build full rr_points list (t, rr, cls) for time-sharing mode
-            rr_pts_full = [(t, r, c) for (t, r), c in zip(pts, rr_classes) if r > 200]
             self.lorenz_canvas.set_data(rr_x, rr_y, x_range=(lo, hi), y_range=(lo, hi),
                                         beat_classes=plot_beat_classes, rr_points=rr_pts_full)
+        elif len(rr_n) == 1:
+            self.lorenz_canvas.set_data([rr_n[0]], [rr_n[0]], x_range=(200, 1500), y_range=(200, 1500),
+                                        beat_classes=rr_n_classes, rr_points=rr_pts_full)
         else:
             self.lorenz_canvas.set_data([], [])
 
