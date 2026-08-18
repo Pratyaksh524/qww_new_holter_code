@@ -1640,34 +1640,22 @@ class ECGStripCanvas(QWidget):
             if getattr(self, '_peak_cache_key', None) == data_key and getattr(self, '_peak_cache_start_sec', None) == self._start_sec:
                 detected_peaks = self._detected_peaks_cache
             else:
-                # Detect R-peaks in real-time from the ECG signal
+                # Detect R-peaks using the full Pan-Tompkins algorithm
+                # (same function used by heart_rate.py and comprehensive_analysis.py)
                 if len(d) > 50:
                     try:
-                        from scipy.signal import find_peaks
-                        
-                        # Simple R-peak detection
-                        # 1. Find local maxima in the signal
+                        try:
+                            from ecg.pan_tompkins import pan_tompkins
+                        except ImportError:
+                            from ...pan_tompkins import pan_tompkins
+
                         signal = np.asarray(d, dtype=float)
-                        
-                        # Normalize signal for better peak detection
-                        sig_mean = np.mean(signal)
-                        sig_std = np.std(signal)
-                        if sig_std > 0:
-                            normalized = (signal - sig_mean) / sig_std
-                        else:
-                            normalized = signal - sig_mean
-                        
-                        # Find peaks with minimum distance (0.3s = 150 samples at 500Hz)
-                        # and height threshold (signal should be above mean)
-                        min_distance = int(0.3 * self._fs)  # Minimum 300ms between R-peaks
-                        peaks, properties = find_peaks(normalized, 
-                                                       distance=min_distance,
-                                                       height=0.5,  # Above 0.5 std
-                                                       prominence=0.3)
-                        
+                        # pan_tompkins() returns sample indices of R-peaks
+                        peak_indices = pan_tompkins(signal, fs=self._fs)
+
                         # Convert peak indices to timestamps
-                        for peak_idx in peaks:
-                            ts = self._start_sec + (peak_idx / self._fs)
+                        for peak_idx in peak_indices:
+                            ts = self._start_sec + (int(peak_idx) / self._fs)
                             detected_peaks.append(ts)
                         
                         # Store detected peaks in parent panel for cross-lead vertical lines
@@ -1712,8 +1700,26 @@ class ECGStripCanvas(QWidget):
                 from ecg.holter.holter_summary_calc import get_template_beats_for_badges
                 
                 # Use beat annotations (which includes all beats in window) and structured events
-                window_beats = getattr(self, '_beat_annotations', [])
+                window_beats = list(getattr(self, '_beat_annotations', []))
                 window_events = getattr(self, '_structured_events', [])
+                
+                # If _beat_annotations is empty, construct beat objects from Pan-Tompkins detected peaks
+                # so that Stage 4, 5 & 7 badge logic can run reclassification and generate badges
+                if not window_beats and getattr(self, '_detected_peaks_cache', None):
+                    peaks = self._detected_peaks_cache
+                    for i, ts in enumerate(peaks):
+                        rr_ms = (peaks[i] - peaks[i-1]) * 1000.0 if i > 0 else 800.0
+                        s_idx = max(0, int((ts - self._start_sec - 0.3) * self._fs))
+                        e_idx = min(len(d), int((ts - self._start_sec + 0.3) * self._fs))
+                        seg = d[s_idx:e_idx] if s_idx < e_idx else None
+                        window_beats.append({
+                            'timestamp': ts,
+                            'rr_ms': rr_ms,
+                            'label': 'N',
+                            'short_code': 'N',
+                            'segment': seg,
+                            'fs': self._fs
+                        })
                 
                 # DEBUG: Print what we have
                 if lead_name == 'I':  # Only print once per refresh

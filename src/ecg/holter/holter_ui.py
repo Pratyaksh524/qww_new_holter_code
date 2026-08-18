@@ -1,4 +1,4 @@
-﻿"""
+"""
 ecg/holter/holter_ui.py
 ========================
 Complete Holter Monitor UI - Professional Medical Software
@@ -1462,7 +1462,7 @@ class HolterMainWindow(QDialog):
         ab_layout.setContentsMargins(8, 6, 8, 6)
         ab_layout.setSpacing(6)
         self._action_buttons = {}
-        for label in ["Browse", "Search", "Analyse", "View", "Import", "Backup", "Delete"]:
+        for label in ["Browse", "Search", "Analyse", "View", "Import", "Backup"]:
             btn = QPushButton(label)
             btn.setFixedHeight(30)
             btn.setStyleSheet(_style_btn())
@@ -1716,13 +1716,19 @@ class HolterMainWindow(QDialog):
                 f"Focused view: {self._tabs.tabText(idx)}"
             )
         )
-        self._action_buttons["Browse"].clicked.connect(self._open_recordings_folder)
-        self._action_buttons["Search"].clicked.connect(self._search_recordings)
-        self._action_buttons["Analyse"].clicked.connect(lambda: self._focus_tab("REPLAY"))
-        self._action_buttons["View"].clicked.connect(lambda: self._focus_tab("PREVIEW"))
-        self._action_buttons["Import"].clicked.connect(self._import_recording)
-        self._action_buttons["Backup"].clicked.connect(self._backup_recordings)
-        self._action_buttons["Delete"].clicked.connect(self._delete_recording)
+        action_handlers = {
+            "Browse": self._open_recordings_folder,
+            "Search": self._search_recordings,
+            "Analyse": lambda: self._focus_tab("REPLAY"),
+            "View": lambda: self._focus_tab("PREVIEW"),
+            "Import": self._import_recording,
+            "Backup": self._backup_recordings,
+            "Delete": self._delete_recording,
+        }
+        for name, handler in action_handlers.items():
+            btn = self._action_buttons.get(name)
+            if btn is not None:
+                btn.clicked.connect(handler)
         for label, btn in self._filter_buttons.items():
             btn.clicked.connect(lambda _, t=label: self._apply_recordings_filter(t))
 
