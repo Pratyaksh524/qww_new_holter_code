@@ -1793,26 +1793,55 @@ class HolterMainWindow(QDialog):
 
     def _build_linked_events(self) -> list:
         events = []
+        # 1. Manual marks and user-saved events from replay engine
         if self._replay_engine:
             try:
-                events.extend(self._replay_engine.get_events_list() or [])
+                for ev in (self._replay_engine.get_events_list() or []):
+                    if ev.get('is_manual', False) or ev.get('source') == 'Manual':
+                        events.append(dict(ev))
             except Exception:
                 pass
+
+        # 2. Collect all beats from metrics
+        all_beats = []
         for metric in self._metrics_list or []:
+            for b in metric.get('all_beats', []) or []:
+                if isinstance(b, dict):
+                    all_beats.append(b)
+
+            # Keep NSR / Sinus Rhythm detection as requested
             base_t = float(metric.get('t', 0.0) or 0.0)
             for label in metric.get('arrhythmias', []) or []:
-                events.append({
-                    'timestamp': base_t,
-                    'label': str(label),
-                    'time_str': _sec_to_hms(base_t),
-                })
-            for ev in metric.get('classified_events', []) or []:
-                t_val = float(ev.get('timestamp', base_t) or base_t)
-                events.append({
-                    'timestamp': t_val,
-                    'label': str(ev.get('label', ev.get('template_label', 'Beat Event'))),
-                    'time_str': _sec_to_hms(t_val),
-                })
+                lbl = str(label).strip()
+                lbl_lower = lbl.lower()
+                if 'sinus' in lbl_lower or 'normal' in lbl_lower:
+                    events.append({
+                        'timestamp': base_t,
+                        'label': lbl,
+                        'source': 'analysis',
+                        'confidence': 1.0,
+                        'time_str': _sec_to_hms(base_t),
+                    })
+
+        # 3. Generate auto-detection badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.)
+        try:
+            from .holter_summary_calc import get_template_beats_for_badges
+            badges = get_template_beats_for_badges(all_beats, [])
+            for b in badges:
+                badge_name = b.get('name', '').strip()
+                if not badge_name:
+                    continue
+                # Skip normal badges (only include auto detection arrhythmia badges: SVT, VT, Couplet, etc.)
+                if b.get('code') in ['V', 'S', 'AF', 'P'] or b.get('critical', False) or 'run' in badge_name.lower() or 'couplet' in badge_name.lower() or 'bigeminy' in badge_name.lower() or 'trigeminy' in badge_name.lower():
+                    events.append({
+                        'timestamp': float(b.get('timestamp', 0.0) or 0.0),
+                        'label': badge_name,
+                        'source': 'analysis',
+                        'confidence': 1.0,
+                        'time_str': _sec_to_hms(float(b.get('timestamp', 0.0) or 0.0)),
+                    })
+        except Exception as e:
+            print(f"[HolterUI] Error generating badge events: {e}")
 
         events.sort(key=lambda e: float(e.get('timestamp', 0.0) or 0.0))
         dedup = []
