@@ -2159,8 +2159,8 @@ class HolterFullDisclosureDialog(QDialog):
                     for b in m.get('all_beats', []):
                         ts = float(b.get('timestamp', 0.0))
                         lbl = str(b.get('label', 'N'))
-                        is_man = b.get('is_manual', False)
-                        if is_man or lbl != 'N':
+                        is_man = b.get('is_manual', False) or (b.get('marking_mode') is not None) or (b.get('batch_id') is not None)
+                        if is_man:
                             seen.add(ts)
                             label_code = lbl
                             if '(' in lbl and ')' in lbl:
@@ -2170,7 +2170,7 @@ class HolterFullDisclosureDialog(QDialog):
                                 'timestamp': ts,
                                 'label': lbl,
                                 'color': beat_color,
-                                'is_manual': is_man
+                                'is_manual': True
                             }
                             if b.get('batch_id') is not None:
                                 beat_entry['batch_id'] = b.get('batch_id')
@@ -2190,8 +2190,8 @@ class HolterFullDisclosureDialog(QDialog):
                     ts = float(b.get('timestamp', 0.0))
                     if ts not in seen:
                         lbl = str(b.get('label', 'N'))
-                        is_man = b.get('is_manual', False)
-                        if is_man or lbl != 'N':
+                        is_man = b.get('is_manual', False) or (b.get('marking_mode') is not None) or (b.get('batch_id') is not None)
+                        if is_man:
                             seen.add(ts)
                             saved_color = b.get('color', '')
                             if saved_color:
@@ -2206,7 +2206,7 @@ class HolterFullDisclosureDialog(QDialog):
                                 'timestamp': ts,
                                 'label': lbl,
                                 'color': color,
-                                'is_manual': is_man
+                                'is_manual': True
                             }
                             if b.get('batch_id') is not None:
                                 beat_entry['batch_id'] = b.get('batch_id')

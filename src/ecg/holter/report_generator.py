@@ -21,7 +21,7 @@ import numpy as np
 from datetime import datetime
 from typing import List, Dict, Optional
 
-from .session_store import load_events
+from .session_store import load_events, load_metrics
 
 # Add project root
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,6 +67,201 @@ def generate_holter_report(session_dir: str,
         traceback.print_exc()
         return _generate_text_report(session_dir, patient_info, summary,
                                       output_path.replace('.pdf', '.txt'))
+
+
+def _build_timeline_events(session_dir: str) -> List[Dict[str, object]]:
+    """
+    Builds the event timeline for the report:
+    1. Loads manual markings (manual_segments.json and manual_beats.json) - EXACT MANUAL MARKING LOGIC.
+    2. Loads auto-detected metrics/beats and computes rich Badge labels (get_template_beats_for_badges).
+    3. Retains 'Normal Sinus Rhythm' for auto-detection windows.
+    4. Filters out older/generic auto labels (e.g. raw PAC, Second degree AV, Wide QRS, Long QT, etc.).
+    5. Suppresses auto-detected events if they fall inside manually marked areas.
+    6. Appends manual beat and segment markings (unaltered).
+    7. Chronologically sorts all events.
+    """
+    # Load manual segments and beats to filter automated events within manually marked areas
+    manual_segments = []
+    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
+    if os.path.exists(manual_segments_path):
+        try:
+            with open(manual_segments_path, 'r') as _ms_f:
+                manual_segments = json.load(_ms_f)
+            print(f"[HolterReport] Loaded {len(manual_segments)} manual segments for filtering")
+        except Exception as _ms_e:
+            print(f"[HolterReport] Could not load manual segments for filtering: {_ms_e}")
+
+    manual_beats = []
+    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
+    if os.path.exists(manual_beats_path):
+        try:
+            with open(manual_beats_path, 'r') as _mb_f:
+                loaded_beats = json.load(_mb_f)
+                manual_beats = [
+                    mb for mb in loaded_beats 
+                    if mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)
+                ]
+            print(f"[HolterReport] Loaded {len(manual_beats)} manual beats for filtering")
+        except Exception as _mb_e:
+            print(f"[HolterReport] Could not load manual beats for filtering: {_mb_e}")
+
+    # Load metrics to extract all_beats and auto-detected rhythm (e.g. Normal Sinus Rhythm)
+    metrics = load_metrics(session_dir)
+    if not metrics:
+        jsonl_path = os.path.join(session_dir, 'metrics.jsonl')
+        if os.path.exists(jsonl_path):
+            try:
+                with open(jsonl_path, 'r', encoding='utf-8') as _jf:
+                    for line in _jf:
+                        line = line.strip()
+                        if line:
+                            metrics.append(json.loads(line))
+            except Exception as _je:
+                print(f"[HolterReport] Could not read metrics.jsonl: {_je}")
+
+    all_beats = []
+    auto_events = []
+
+    for metric in metrics or []:
+        for b in metric.get('all_beats', []) or []:
+            if isinstance(b, dict):
+                all_beats.append(b)
+
+        # Keep Normal Sinus Rhythm / Sinus Rhythm from auto detection
+        base_t = float(metric.get('t', 0.0) or 0.0)
+        for label in metric.get('arrhythmias', []) or []:
+            lbl = str(label).strip()
+            lbl_lower = lbl.lower()
+            if 'sinus' in lbl_lower or 'normal' in lbl_lower:
+                auto_events.append({
+                    'timestamp': base_t,
+                    'label': lbl,
+                    'event_type': lbl,
+                    'source': 'analysis',
+                    'confidence': float(metric.get('quality', 1.0) or 1.0),
+                })
+
+    # Generate auto-detection badge events (SVT, VT, Couplet, Bigeminy, PVC, PAC, etc.)
+    try:
+        from .holter_summary_calc import get_template_beats_for_badges
+        badges = get_template_beats_for_badges(all_beats, [])
+        for b in badges:
+            badge_name = b.get('name', '').strip()
+            if not badge_name:
+                continue
+            # Filter for arrhythmia badge beats/patterns (V, S, AF, P, runs, couplets, bigeminy, etc.)
+            if (b.get('code') in ['V', 'S', 'AF', 'P'] or 
+                b.get('critical', False) or 
+                any(k in badge_name.lower() for k in ['run', 'couplet', 'bigeminy', 'trigeminy', 'quadrigeminy', 'tachycardia', 'fibrillation', 'flutter'])):
+                auto_events.append({
+                    'timestamp': float(b.get('timestamp', 0.0) or 0.0),
+                    'label': badge_name,
+                    'event_type': b.get('code', 'Arrhythmia'),
+                    'source': 'analysis',
+                    'confidence': 1.0,
+                })
+    except Exception as _badge_e:
+        print(f"[HolterReport] Error generating badge events: {_badge_e}")
+
+    # Fallback if no beats in metrics: check load_events but keep only NSR
+    if not auto_events and not all_beats:
+        raw_events = load_events(session_dir)
+        for ev in raw_events:
+            ev_lbl = str(ev.get('label', ev.get('event_type', ''))).lower()
+            if 'sinus' in ev_lbl or 'normal' in ev_lbl:
+                auto_events.append(ev)
+
+    # Filter auto-detected events if they fall inside manually marked areas
+    filtered_events = []
+    for event in auto_events:
+        event_ts = float(event.get('timestamp', 0.0))
+        should_filter = False
+
+        # Check segment ranges
+        for seg in manual_segments:
+            start_sec = float(seg.get('start_sec', 0.0))
+            end_sec = float(seg.get('end_sec', 0.0))
+            if start_sec <= event_ts <= end_sec:
+                should_filter = True
+                break
+
+        # Check parallel marking timestamps (within 0.15s tolerance)
+        if not should_filter and manual_beats:
+            for mb in manual_beats:
+                mb_ts = float(mb.get('timestamp', 0.0))
+                if abs(event_ts - mb_ts) < 0.15:
+                    should_filter = True
+                    break
+
+        if not should_filter:
+            filtered_events.append(event)
+
+    timeline_events = filtered_events
+
+    # Load manual beats and append non-normal ones to timeline (parallel manual marking)
+    # [EXACT ORIGINAL MANUAL MARKING LOGIC]
+    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
+    if os.path.exists(manual_beats_path):
+        try:
+            with open(manual_beats_path, 'r') as _mb_f:
+                manual_beats = json.load(_mb_f)
+            for mb in manual_beats:
+                if not (mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)):
+                    continue
+                lbl = mb.get('label', 'N')
+                short_code = lbl
+                if '(' in lbl and ')' in lbl:
+                    short_code = lbl.split('(')[1].split(')')[0]
+                if short_code != 'N':
+                    marking_mode = mb.get('marking_mode', 'parallel_single')
+                    if marking_mode == 'parallel_multi':
+                        label_text = f"Parallel multiple mark ({lbl})"
+                    else:
+                        label_text = f"Parallel single beat manual marked ({lbl})"
+                    timeline_events.append({
+                        'timestamp': float(mb.get('timestamp', 0.0)),
+                        'label': label_text,
+                        'event_type': lbl,
+                        'source': 'Manual'
+                    })
+        except Exception as _mb_e:
+            print(f"[HolterReport] Could not load manual beats for timeline: {_mb_e}")
+
+    # Load manual segments and append to timeline (segment manual marking)
+    # [EXACT ORIGINAL MANUAL MARKING LOGIC]
+    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
+    if os.path.exists(manual_segments_path):
+        try:
+            with open(manual_segments_path, 'r') as _ms_f:
+                manual_segments = json.load(_ms_f)
+            for seg in manual_segments:
+                lbl = seg.get('label', 'Unknown')
+                start_sec = seg.get('start_sec', 0.0)
+                end_sec = seg.get('end_sec', 0.0)
+                start_time_str = seg.get('start_time_str', '')
+                end_time_str = seg.get('end_time_str', '')
+                # Start-of-segment entry
+                timeline_events.append({
+                    'timestamp': float(start_sec),
+                    'sort_ts': float(start_sec),
+                    'label': f"Segment manual marked ({lbl})",
+                    'event_type': lbl,
+                    'source': 'Manual'
+                })
+                # End-of-segment entry
+                timeline_events.append({
+                    'timestamp': float(end_sec),
+                    'sort_ts': float(start_sec) + 1e-6,
+                    'label': f"Segment manual marked end ({lbl})",
+                    'event_type': lbl,
+                    'source': 'Manual'
+                })
+        except Exception as _ms_e:
+            print(f"[HolterReport] Could not load manual segments for timeline: {_ms_e}")
+
+    # Sort all events chronologically by timestamp (sort_ts overrides timestamp for manual segment end-rows)
+    timeline_events = sorted(timeline_events, key=lambda x: float(x.get("sort_ts", x.get("timestamp", 0.0)) or 0.0))
+    return timeline_events
 
 
 #    PDF Report                                                                  
@@ -249,6 +444,8 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     # Count manual markings by label type
     manual_arrhy_counts = {}
     for mb in manual_beats:
+        if not (mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)):
+            continue
         lbl = mb.get('label', 'N')
         # Extract short code from full label name (e.g., "Normal(N)" -> "N")
         short_code = lbl
@@ -303,157 +500,9 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
     else:
         story.append(Paragraph("No significant arrhythmias detected during this recording.", body_style))
 
-    # Load manual segments and beats to filter automated events within manually marked areas
-    manual_segments = []
-    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
-    if os.path.exists(manual_segments_path):
-        try:
-            with open(manual_segments_path, 'r') as _ms_f:
-                manual_segments = json.load(_ms_f)
-            print(f"[HolterReport] Loaded {len(manual_segments)} manual segments for filtering")
-        except Exception as _ms_e:
-            print(f"[HolterReport] Could not load manual segments for filtering: {_ms_e}")
-    
-    manual_beats = []
-    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
-    if os.path.exists(manual_beats_path):
-        try:
-            with open(manual_beats_path, 'r') as _mb_f:
-                manual_beats = json.load(_mb_f)
-            print(f"[HolterReport] Loaded {len(manual_beats)} manual beats for filtering")
-        except Exception as _mb_e:
-            print(f"[HolterReport] Could not load manual beats for filtering: {_mb_e}")
-    
-    timeline_events = load_events(session_dir)
-    print(f"[HolterReport] Loaded {len(timeline_events)} events from database")
-    
-    # Filter out auto-detected arrhythmias (except Normal Sinus Rhythm) from event timeline
-    # Keep manual markings and Normal Sinus Rhythm only
-    # Also filter out Long QT Syndrome and Wide QRS (non-specific) as requested
-    original_count = len(timeline_events)
-    filtered_events = []
-    for event in timeline_events:
-        # Keep manual events (they should not be filtered)
-        if event.get('source') == 'Manual':
-            filtered_events.append(event)
-            continue
-        
-        event_label = str(event.get('label', event.get('event_type', ''))).lower()
-
-        # Filter out Long QT Syndrome and Wide QRS (non-specific) from report
-        if 'long qt' in event_label or 'wide qrs' in event_label:
-            continue
-        
-        # Filter out Frequent PVCs and Multifocal PVCs from event timeline as requested
-        if 'frequent pvc' in event_label or 'multifocal pvc' in event_label:
-            continue
-        
-        # Filter out auto-detected events - INCLUDING Normal Sinus Rhythm -
-        # if they fall within a manually marked area. Manual marks take
-        # priority and must suppress any auto label at that time, not just
-        # non-NSR ones. (This used to be split: NSR had its own "always
-        # keep" branch that returned before should_filter was even computed,
-        # which is why an auto "Normal Sinus Rhythm" row could still show up
-        # at the exact same timestamp as a manual VF mark - NSR never
-        # reached the suppression check below.)
-        event_ts = float(event.get('timestamp', 0.0))
-        should_filter = False
-        
-        # Check segment ranges
-        for seg in manual_segments:
-            start_sec = float(seg.get('start_sec', 0.0))
-            end_sec = float(seg.get('end_sec', 0.0))
-            if start_sec <= event_ts <= end_sec:
-                should_filter = True
-                break
-        
-        # Check parallel marking timestamps (within 0.15s tolerance)
-        if not should_filter and manual_beats:
-            for mb in manual_beats:
-                mb_ts = float(mb.get('timestamp', 0.0))
-                if abs(event_ts - mb_ts) < 0.15:
-                    should_filter = True
-                    break
-        
-        if not should_filter:
-            filtered_events.append(event)
-    
-    timeline_events = filtered_events
-    print(f"[HolterReport] Filtered out {original_count - len(timeline_events)} auto-detected arrhythmias (kept Normal Sinus Rhythm and manual markings)")
-    
-    # Load manual beats and append non-normal ones to timeline (parallel manual marking)
-    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
-    if os.path.exists(manual_beats_path):
-        try:
-            with open(manual_beats_path, 'r') as _mb_f:
-                manual_beats = json.load(_mb_f)
-            for mb in manual_beats:
-                lbl = mb.get('label', 'N')
-                # Extract short code from full label name (e.g., "Normal(N)" -> "N")
-                short_code = lbl
-                if '(' in lbl and ')' in lbl:
-                    short_code = lbl.split('(')[1].split(')')[0]
-                if short_code != 'N':
-                    marking_mode = mb.get('marking_mode', 'parallel_single')
-                    if marking_mode == 'parallel_multi':
-                        label_text = f"Parallel multiple mark ({lbl})"
-                    else:
-                        label_text = f"Parallel single beat manual marked ({lbl})"
-                    timeline_events.append({
-                        'timestamp': float(mb.get('timestamp', 0.0)),
-                        'label': label_text,
-                        'event_type': lbl,
-                        'source': 'Manual'
-                    })
-        except Exception as _mb_e:
-            print(f"[HolterReport] Could not load manual beats for timeline: {_mb_e}")
-    
-    # Load manual segments and append to timeline (segment manual marking)
-    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
-    print(f"[HolterReport] Looking for manual segments at: {manual_segments_path}")
-    print(f"[HolterReport] File exists: {os.path.exists(manual_segments_path)}")
-    if os.path.exists(manual_segments_path):
-        try:
-            with open(manual_segments_path, 'r') as _ms_f:
-                manual_segments = json.load(_ms_f)
-            print(f"[HolterReport] Loaded {len(manual_segments)} manual segments from file")
-            for seg in manual_segments:
-                lbl = seg.get('label', 'Unknown')
-                start_sec = seg.get('start_sec', 0.0)
-                end_sec = seg.get('end_sec', 0.0)
-                start_time_str = seg.get('start_time_str', '')
-                end_time_str = seg.get('end_time_str', '')
-                # Show start and end time with label
-                time_range = f"{start_time_str} - {end_time_str}" if start_time_str and end_time_str else f"{_sec_to_hms(start_sec)} - {_sec_to_hms(end_sec)}"
-                # Start-of-segment entry
-                timeline_events.append({
-                    'timestamp': float(start_sec),
-                    'sort_ts': float(start_sec),
-                    'label': f"Segment manual marked ({lbl})",
-                    'event_type': lbl,
-                    'source': 'Manual'
-                })
-                # End-of-segment entry — shows the segment's end system time.
-                # sort_ts is nudged a hair past start_sec (rather than using
-                # the true end_sec) so this row always sorts immediately
-                # below its start row, even when other analysis events fall
-                # chronologically in between the two.
-                timeline_events.append({
-                    'timestamp': float(end_sec),
-                    'sort_ts': float(start_sec) + 1e-6,
-                    'label': f"Segment manual marked end ({lbl})",
-                    'event_type': lbl,
-                    'source': 'Manual'
-                })
-        except Exception as _ms_e:
-            print(f"[HolterReport] Could not load manual segments for timeline: {_ms_e}")
-    else:
-        print(f"[HolterReport] Manual segments file not found at {manual_segments_path}")
-            
-    # Sort all events chronologically by timestamp (sort_ts overrides timestamp
-    # for manual segment end-rows, so they stay pinned beneath their start-row)
-    timeline_events = sorted(timeline_events, key=lambda x: float(x.get("sort_ts", x.get("timestamp", 0.0)) or 0.0))
-    print(f"[HolterReport] Total timeline events after adding manual segments: {len(timeline_events)}")
+    # Build complete timeline events (Badge labels for auto-detection + exact Manual Markings)
+    timeline_events = _build_timeline_events(session_dir)
+    print(f"[HolterReport] Total timeline events: {len(timeline_events)}")
 
     if timeline_events:
         story.append(Spacer(1, 6*mm))
@@ -617,7 +666,11 @@ def _generate_pdf_report(session_dir, patient_info, summary, output_path, settin
             if os.path.exists(manual_beats_path):
                 try:
                     with open(manual_beats_path, 'r') as _mb_f:
-                        manual_beats = json.load(_mb_f)
+                        raw_beats = json.load(_mb_f)
+                        manual_beats = [
+                            mb for mb in raw_beats 
+                            if mb.get('is_manual', False) or (mb.get('marking_mode') is not None) or (mb.get('batch_id') is not None)
+                        ]
                     print(f"[HolterReport] Loaded {len(manual_beats)} manual beats from {manual_beats_path}")
                 except Exception as _mb_e:
                     print(f"[HolterReport] Could not load manual beats: {_mb_e}")
@@ -839,125 +892,8 @@ def _generate_text_report(session_dir, patient_info, summary, output_path) -> st
     else:
         lines.append("  None detected")
 
-    # Load manual segments and beats to filter automated events within manually marked areas
-    manual_segments = []
-    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
-    if os.path.exists(manual_segments_path):
-        try:
-            with open(manual_segments_path, 'r') as _ms_f:
-                manual_segments = json.load(_ms_f)
-            print(f"[HolterReport] Loaded {len(manual_segments)} manual segments for filtering (text report)")
-        except Exception as _ms_e:
-            print(f"[HolterReport] Could not load manual segments for filtering: {_ms_e}")
-    
-    manual_beats = []
-    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
-    if os.path.exists(manual_beats_path):
-        try:
-            with open(manual_beats_path, 'r') as _mb_f:
-                manual_beats = json.load(_mb_f)
-            print(f"[HolterReport] Loaded {len(manual_beats)} manual beats for filtering (text report)")
-        except Exception as _mb_e:
-            print(f"[HolterReport] Could not load manual beats for filtering: {_mb_e}")
-    
-    timeline_events = load_events(session_dir)
-    
-    # Filter out automated events that fall within manually marked segments or near parallel markings
-    if manual_segments or manual_beats:
-        original_count = len(timeline_events)
-        filtered_events = []
-        for event in timeline_events:
-            # Keep manual events (they should not be filtered)
-            if event.get('source') == 'Manual':
-                filtered_events.append(event)
-                continue
-            
-            # Check if this automated event falls within any manually marked segment
-            event_ts = float(event.get('timestamp', 0.0))
-            should_filter = False
-            
-            # Check segment ranges
-            for seg in manual_segments:
-                start_sec = float(seg.get('start_sec', 0.0))
-                end_sec = float(seg.get('end_sec', 0.0))
-                if start_sec <= event_ts <= end_sec:
-                    should_filter = True
-                    break
-            
-            # Check parallel marking timestamps (within 0.15s tolerance)
-            if not should_filter and manual_beats:
-                for mb in manual_beats:
-                    mb_ts = float(mb.get('timestamp', 0.0))
-                    if abs(event_ts - mb_ts) < 0.15:
-                        should_filter = True
-                        break
-            
-            if not should_filter:
-                filtered_events.append(event)
-        
-        timeline_events = filtered_events
-        print(f"[HolterReport] Filtered out {original_count - len(timeline_events)} automated events within manual markings (text report)")
-    
-    # Load manual beats and append non-normal ones to timeline (parallel manual marking)
-    manual_beats_path = os.path.join(session_dir, 'manual_beats.json')
-    if os.path.exists(manual_beats_path):
-        try:
-            with open(manual_beats_path, 'r') as _mb_f:
-                manual_beats = json.load(_mb_f)
-            for mb in manual_beats:
-                lbl = mb.get('label', 'N')
-                # Extract short code from full label name (e.g., "Normal(N)" -> "N")
-                short_code = lbl
-                if '(' in lbl and ')' in lbl:
-                    short_code = lbl.split('(')[1].split(')')[0]
-                if short_code != 'N':
-                    marking_mode = mb.get('marking_mode', 'parallel_single')
-                    if marking_mode == 'parallel_multi':
-                        label_text = f"Parallel multiple mark ({lbl})"
-                    else:
-                        label_text = f"Parallel single beat manual marked ({lbl})"
-                    timeline_events.append({
-                        'timestamp': float(mb.get('timestamp', 0.0)),
-                        'label': label_text,
-                        'event_type': lbl,
-                        'source': 'Manual'
-                    })
-        except Exception as _mb_e:
-            print(f"[HolterReport] Could not load manual beats for timeline: {_mb_e}")
-    
-    # Load manual segments and append to timeline (segment manual marking)
-    manual_segments_path = os.path.join(session_dir, 'manual_segments.json')
-    if os.path.exists(manual_segments_path):
-        try:
-            with open(manual_segments_path, 'r') as _ms_f:
-                manual_segments = json.load(_ms_f)
-            for seg in manual_segments:
-                lbl = seg.get('label', 'Unknown')
-                start_sec = seg.get('start_sec', 0.0)
-                end_sec = seg.get('end_sec', 0.0)
-                start_time_str = seg.get('start_time_str', '')
-                end_time_str = seg.get('end_time_str', '')
-                # Start-of-segment entry
-                timeline_events.append({
-                    'timestamp': float(start_sec),
-                    'sort_ts': float(start_sec),
-                    'label': f"Segment manual marked ({lbl})",
-                    'event_type': lbl,
-                    'source': 'Manual'
-                })
-                # End-of-segment entry
-                timeline_events.append({
-                    'timestamp': float(end_sec),
-                    'sort_ts': float(start_sec) + 1e-6,
-                    'label': f"Segment manual marked end ({lbl})",
-                    'event_type': lbl,
-                    'source': 'Manual'
-                })
-        except Exception as _ms_e:
-            print(f"[HolterReport] Could not load manual segments for timeline: {_ms_e}")
-    
-    # Sort all events chronologically
-    timeline_events = sorted(timeline_events, key=lambda x: float(x.get("sort_ts", x.get("timestamp", 0.0)) or 0.0))
+    # Build complete timeline events (Badge labels for auto-detection + exact Manual Markings)
+    timeline_events = _build_timeline_events(session_dir)
     
     if timeline_events:
         lines += ["", "EVENT TIMELINE"]
