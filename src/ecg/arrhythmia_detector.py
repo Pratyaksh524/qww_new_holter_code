@@ -828,6 +828,31 @@ def is_ventricular_fibrillation(signal: np.ndarray, r_peaks: List[int], fs: floa
         # Organised atrial activity = not VFib
         return False
 
+    # ── Physiological gate: VF cannot present at an organised normal rate ────
+    # The scoring above can reach 0.65 from RR-variability (0.30) + amplitude
+    # variability (0.20) + baseline chaos (0.15) alone — i.e. entirely from
+    # NOISE, with the rate criterion never firing. That is how a 65 bpm sinus
+    # recording was reported as Ventricular Fibrillation.
+    #
+    # VF is a ventricular rate of roughly 150-400 bpm with no organised
+    # activation. If most RR intervals are long AND the implied rate is an
+    # ordinary physiological one, the rhythm is organised and this is not VF,
+    # however noisy the trace looks. Real VF still passes: its RR intervals are
+    # short and chaotic, so short_rr_ratio is high and this gate does not apply.
+    if len(valid_rr) > 3:
+        median_rr_ms = float(np.median(valid_rr))
+        if median_rr_ms > 0:
+            implied_hr = 60000.0 / median_rr_ms
+            if short_rr_ratio <= 0.35 and 20.0 <= implied_hr <= 150.0:
+                if score >= 0.60:
+                    print(
+                        f" VFib rejected: organised rhythm at {implied_hr:.0f} bpm "
+                        f"(median RR {median_rr_ms:.0f} ms, only "
+                        f"{short_rr_ratio*100:.0f}% of beats < 450 ms). "
+                        f"Noise score was {score:.2f}."
+                    )
+                return False
+
     # Final Decision: Score threshold lowered slightly to account for Pan-Tompkins integration
     return score >= 0.60
 

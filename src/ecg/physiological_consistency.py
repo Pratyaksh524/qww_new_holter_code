@@ -58,7 +58,13 @@ def validate_diagnoses(
 
     organized_qrs = bool(features.get("organized_qrs", True))
     if features.get("vf_score", 0.0) > 0.6:
-        organized_qrs = False
+        # A high VF score used to unconditionally erase organised-QRS evidence,
+        # which then disarmed the very rule below that is meant to catch a false
+        # VF. If the QRS was positively MEASURED at a normal narrow width, that
+        # measurement is hard evidence of organised activation and outranks a
+        # heuristic score built partly from baseline noise.
+        if not (0.0 < qrs < 120.0):
+            organized_qrs = False
 
     hr_reliable = bool(hr > 0.0 and hr < 300.0)
 
@@ -128,8 +134,37 @@ def validate_diagnoses(
         # AND HR is reliable. If VF score is high, override organized_qrs check.
         elif name in ("Ventricular Fibrillation", "VFib", "VF"):
             vf_score = float(features.get("vf_score") or 0.0)
-            if vf_score >= 0.5:
-                # Strong VF evidence — never suppress, even if HR looks calculable
+
+            # Hard contradictions first — these outrank the score.
+            #
+            # VF is disorganised ventricular activity with no atrial-to-
+            # ventricular conduction. If this same analysis measured a PR
+            # interval, it found P waves conducting to QRS complexes, and the
+            # rhythm is by definition not VF. Likewise a ventricular rate in the
+            # ordinary physiological band is incompatible with VF (150-400 bpm).
+            #
+            # A report reading "HR 65 bpm, PR 152 ms, QRS 106 ms" alongside a
+            # conclusion of "Ventricular Fibrillation" is self-contradictory,
+            # and it was reachable because a vf_score >= 0.5 skipped this rule
+            # entirely. The score is a heuristic built partly from baseline
+            # noise; a measured PR interval is evidence.
+            organised_rate = 20.0 < hr < 150.0
+            if pr_measured and organised_rate:
+                reject = True
+                rejection_reason = (
+                    f"Measured PR interval ({pr:.0f} ms) at {hr:.0f} bpm proves "
+                    f"atrioventricular conduction — VF has none "
+                    f"(vf_score was {vf_score:.2f})"
+                )
+            elif 0.0 < qrs < 120.0 and organised_rate:
+                reject = True
+                rejection_reason = (
+                    f"Narrow organised QRS ({qrs:.0f} ms) at {hr:.0f} bpm "
+                    f"contradicts VF, which has no organised QRS "
+                    f"(vf_score was {vf_score:.2f})"
+                )
+            elif vf_score >= 0.5:
+                # No hard contradiction present — defer to the detector.
                 pass
             elif organized_qrs and hr_reliable:
                 reject = True

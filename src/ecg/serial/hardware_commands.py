@@ -160,8 +160,11 @@ class HardwareCommandHandler:
                             # Remove processed packet from buffer
                             buffer = buffer[start_idx + 22:]
                             return packet
-            
-            time.sleep(0.01)  # Small delay to avoid CPU spinning
+                # Bytes were consumed this pass: look again before sleeping.
+                continue
+
+            # Nothing at the port — yield briefly rather than spinning.
+            time.sleep(0.002)
         
         return None
     
@@ -384,22 +387,32 @@ class HardwareCommandHandler:
         buffer = bytearray()
         
         while (time.time() - start_time) < timeout:
-            if self.ser.in_waiting:
-                b = self.ser.read(1)
-                if not b:
+            waiting = self.ser.in_waiting
+            if waiting:
+                # Bulk read, then run the SAME per-byte framing below. Reading one
+                # byte per loop and sleeping 0.01 s after each of them capped this
+                # at ~65 bytes/s (Windows sleep granularity is ~15 ms) against a
+                # device sending ~11,000 bytes/s, so the ACK never arrived and the
+                # full timeout was burned on the GUI thread.
+                chunk = self.ser.read(waiting)
+                if not chunk:
                     continue
-                
-                if not buffer:
-                    if b[0] == START_BYTE:
-                        buffer.append(b[0])
-                else:
-                    buffer.append(b[0])
-                    if len(buffer) == FRAME_LEN:
-                        if buffer[-1] == END_BYTE:
-                            return bytes(buffer)
-                        buffer.clear()
-            
-            time.sleep(0.01)  # Small delay to avoid CPU spinning
+
+                for byte_val in chunk:
+                    if not buffer:
+                        if byte_val == START_BYTE:
+                            buffer.append(byte_val)
+                    else:
+                        buffer.append(byte_val)
+                        if len(buffer) == FRAME_LEN:
+                            if buffer[-1] == END_BYTE:
+                                return bytes(buffer)
+                            buffer.clear()
+                # Bytes were consumed this pass: look again before sleeping.
+                continue
+
+            # Nothing at the port — yield briefly rather than spinning.
+            time.sleep(0.002)
         
         raise TimeoutError("Timeout waiting for packet")
     

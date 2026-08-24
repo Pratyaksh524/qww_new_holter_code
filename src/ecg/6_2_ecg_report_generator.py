@@ -1455,6 +1455,14 @@ def generate_6_2_ecg_report(filename="ecg_report.pdf", data=None, lead_images=No
 
     # FILTER: Remove empty conclusions and "---" placeholders - ONLY SHOW REAL CONCLUSIONS
     # MAXIMUM 12 CONCLUSIONS (because only 12 boxes available)
+    # Same five-finding allow-list as the 12x1 layout — one rule for both
+    # layouts of the same test, so they cannot drift apart.
+    try:
+        from .ecg_report_generator import restrict_to_allowed_conclusions
+        dashboard_conclusions = restrict_to_allowed_conclusions(dashboard_conclusions)
+    except Exception as _allow_err:
+        print(f" Could not apply conclusion allow-list: {_allow_err}")
+
     filtered_conclusions = []
     for conclusion in dashboard_conclusions:
         # Keep only non-empty conclusions that are not "---"

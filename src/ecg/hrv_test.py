@@ -1080,6 +1080,11 @@ class HRVTestWindow(QWidget):
             # - RV5/SV1: needs V1 + V5
             _required_header_leads = {"I", "aVF", "V1", "V5"}
 
+            # One list per calculator lead for this tick.
+            _staged_calc = [[] for _ in range(len(self.ecg_calculator.data))] \
+                if self.ecg_calculator else []
+            _staged_display = []
+
             for packet in packets:
                 # Packet is a dictionary with lead names as keys (e.g., {"I": value, "II": value, ...})
                 # Extract selected lead directly from the packet (used for HRV metrics + display).
@@ -1115,15 +1120,15 @@ class HRVTestWindow(QWidget):
                             lead_idx = lead_indices.get(lead_name, None)
                             if lead_idx is None or lead_idx >= len(self.ecg_calculator.data):
                                 continue
-                            self.ecg_calculator.data[lead_idx] = np.roll(self.ecg_calculator.data[lead_idx], -1)
-                            self.ecg_calculator.data[lead_idx][-1] = lead_value_f
+                            # Staged for this tick's block write — see
+                            # ECGTestPage._append_block.
+                            _staged_calc[lead_idx].append(lead_value_f)
 
                         # FORCE UPDATE LEAD II (Index 1) if the selected lead is not II,
                         # to keep the dashboard-style lead II buffer aligned with the selected lead.
                         if self.selected_lead != "II" and lead_value is not None:
                             lead_value_f = float(lead_value)
-                            self.ecg_calculator.data[1] = np.roll(self.ecg_calculator.data[1], -1)
-                            self.ecg_calculator.data[1][-1] = lead_value_f
+                            _staged_calc[1].append(lead_value_f)
 
                     except Exception as e:
                         print(f" Error updating calculator buffer: {e}")
@@ -1141,9 +1146,11 @@ class HRVTestWindow(QWidget):
                 # This ensures subsequent code (report storage) works and matches display
                 smoothed_value = lead_value
                 
-                # Update local circular buffer for plot
-                self.data = np.roll(self.data, -1)
-                self.data[-1] = lead_value
+                # Update local circular buffer for plot — staged, then written as
+                # one block per tick. This buffer is 10000 samples; rolling it per
+                # sample rebuilt the whole array 500 times a second to feed a
+                # display that is only redrawn ~33 times a second.
+                _staged_display.append(lead_value)
                 n_new += 1
                 
                 if self.ecg_calculator and hasattr(self.ecg_calculator, "sampler"):
@@ -1164,6 +1171,22 @@ class HRVTestWindow(QWidget):
                     'value': smoothed_value  # Reports use smoothed values for clean graphs
                 })
                 
+            # Commit this tick's display samples in one slice.
+            if _staged_display:
+                try:
+                    ECGTestPage._append_block(self.data, _staged_display)
+                except Exception as _e:
+                    print(f' Error flushing HRV display buffer: {_e}')
+
+            # One block write per lead for the whole tick.
+            if self.ecg_calculator and _staged_calc:
+                for _i, _vals in enumerate(_staged_calc):
+                    if _vals and _i < len(self.ecg_calculator.data):
+                        try:
+                            ECGTestPage._append_block(self.ecg_calculator.data[_i], _vals)
+                        except Exception as _e:
+                            print(f' Error flushing calculator lead {_i}: {_e}')
+
             if not self.is_capturing:
                 self._plot_update_in_progress = False
                 return

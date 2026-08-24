@@ -1272,7 +1272,14 @@ class ECGTestPage(QWidget):
         # Initialize recording variables
         self.is_recording = False
         self.recording_writer = None
-        self.recording_frames = []
+        # Bounded: a screen recording must not be able to consume all of RAM.
+        # At 33 fps a 1920x1080 BGR frame is 6.22 MB, so an uncapped list grew at
+        # ~187 MB/s and reached ~5.6 GB in 30 s. The cap is applied in
+        # start_recording() once the timer interval is known; deque(maxlen=...)
+        # then drops the oldest frame instead of growing.
+        self._RECORDING_MAX_SECONDS = 120
+        self._RECORDING_MAX_WIDTH = 1280
+        self.recording_frames = deque()
         
         # Initialize recording button state (disabled by default until acquisition/demo starts)
         QTimer.singleShot(100, self.update_recording_button_state)
@@ -2282,6 +2289,79 @@ class ECGTestPage(QWidget):
             # Fallback: simple mean if moving average fails
             return np.nanmean(signal) if len(signal) > 0 else 0.0
 
+    @staticmethod
+    def _append_block(buf, values):
+        """Append `values` to the end of a fixed-length chronological buffer.
+
+        Replaces `buf = np.roll(buf, -1); buf[-1] = v` repeated once per sample.
+        np.roll allocates and copies the entire array every call; at 500 Hz x 12
+        leads that was ~240 MB/s of memcpy and ~6000 ndarray allocations per
+        second, whose collection produced a measured 10-13 ms hitch roughly every
+        12 seconds. One memmove per lead per tick has neither cost.
+
+        The buffer keeps its identity, length and ordering — oldest at index 0,
+        newest at index -1 — so every existing reader is unaffected.
+        """
+        n = len(values)
+        if n <= 0:
+            return
+        size = buf.shape[0]
+        if n >= size:
+            # Batch longer than the whole window: keep only its most recent tail.
+            buf[:] = np.asarray(values[-size:], dtype=buf.dtype)
+            return
+        buf[:-n] = buf[n:]                                  # slide down, in place
+        buf[-n:] = np.asarray(values, dtype=buf.dtype)      # newest at the end
+
+    def _flush_staged_samples(self, staged):
+        """Commit one tick's staged samples into the rolling lead buffers."""
+        if not staged:
+            return
+        for i, vals in enumerate(staged):
+            if vals and i < len(self.data):
+                try:
+                    self._append_block(self.data[i], vals)
+                except Exception as e:
+                    print(f" Error flushing lead buffer {i}: {e}")
+                vals.clear()
+
+    # A measurement may stand in for a failed window for this long, then it is
+    # discarded. Matches display_updates.HOLD_MAX_SECONDS so the page and the
+    # labels cannot disagree about whether a value is still valid.
+    PAGE_HOLD_MAX_SECONDS = 4.0
+
+    def _hold_or_zero(self, key, fresh_value):
+        """Return `fresh_value` if it is usable, else a recent hold, else 0.
+
+        Without the expiry these holds re-published the last good measurement
+        indefinitely. A Fluke simulator moved from 72 bpm to 3 bpm kept
+        reporting PR 158 / QRS 81 / QT 338 — the analysis window (20 s) cannot
+        contain the three R-peaks needed at that rate, so every subsequent
+        window failed and every failure was answered with the pre-change value.
+        """
+        import time as _time
+        try:
+            value = float(fresh_value or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+
+        if not hasattr(self, '_metric_hold_at'):
+            self._metric_hold_at = {}
+
+        if value > 0:
+            self._metric_hold_at[key] = _time.monotonic()
+            return fresh_value
+
+        stamp = self._metric_hold_at.get(key)
+        if stamp is None:
+            return 0
+        if (_time.monotonic() - stamp) <= self.PAGE_HOLD_MAX_SECONDS:
+            return getattr(self, key, 0) or 0
+
+        # Hold expired — stop echoing a measurement the signal no longer supports.
+        self._metric_hold_at.pop(key, None)
+        return 0
+
     def _build_global_qrs_lead_map(self, reference_length=None):
         """Collect the connected, non-flat leads for the global QRS measurement.
 
@@ -2392,7 +2472,27 @@ class ECGTestPage(QWidget):
         limb_conn = getattr(self, "_lead_connection_state", {})
         limb_active = limb_conn.get('I', True) or limb_conn.get('II', True)
 
-        _is_flat_line_ii = (len(lead_ii_data) < 100 or np.all(lead_ii_data == 0) or _raw_std_ii < 5.0) and not limb_active
+        # A flat trace means there is nothing to measure — whether the leads are
+        # off OR the heart has stopped. The `and not limb_active` condition that
+        # used to be here restricted this to disconnected leads only, so a
+        # genuine asystole with the electrodes still attached fell through to the
+        # full pipeline, which found no R-peaks and then re-published the last
+        # good HR/PR/QRS/QT from before the arrest. A flatline was drawn next to
+        # a live-looking heart rate.
+        #
+        # `_raw_std_ii` is in ADC counts and this is checked AFTER the Lead I
+        # fallback above, so < 5.0 means both limb leads are flat. No real ECG
+        # carrying a QRS has a standard deviation of five ADC counts.
+        _signal_is_flat = (
+            len(lead_ii_data) < 100
+            or np.all(lead_ii_data == 0)
+            or _raw_std_ii < 5.0
+        )
+        # Kept for the log line below: distinguishes "electrodes removed" from
+        # "electrodes on, no cardiac activity". Both zero the metrics; only the
+        # wording differs.
+        _leads_report_connected = bool(limb_active)
+        _is_flat_line_ii = _signal_is_flat
         # LL(F) disconnection: use the fast per-packet flag rather than
         # _lead_connection_state['II'] which only flips after 25 consecutive
         # missing packets. Without this, BPM flickers between 0 and a real
@@ -2401,17 +2501,42 @@ class ECGTestPage(QWidget):
             _is_flat_line_ii = True
         
         if _is_flat_line_ii:
-            # Reset everything to 0 ONLY when all primary limb leads are disconnected
+            # Nothing is measurable on a flat trace. Every value is zeroed —
+            # including the ones the old block missed (QTcF, ST, axes, the
+            # amplitude figures and the pending/deadband state), because any
+            # value left behind here is a pre-arrest number displayed as if it
+            # were current.
+            _asystole = _leads_report_connected  # electrodes on, no activity
+            if not getattr(self, '_flatline_logged', False):
+                print(
+                    " ASYSTOLE — electrodes attached, no cardiac activity: zeroing all metrics"
+                    if _asystole else
+                    " FLATLINE — limb leads disconnected: zeroing all metrics"
+                )
+                self._flatline_logged = True
+            self._asystole_active = bool(_asystole)
+
             self.last_heart_rate   = 0
             self.last_rr_interval  = 0
             self.pr_interval       = 0
             self.last_qrs_duration = 0
             self.last_qt_interval  = 0
             self.last_qtc_interval = 0
+            self.last_qtcf_interval = 0
             self.last_p_duration   = 0
+            self.last_st_interval  = 0
             self._last_displayed_hr  = 0
             self._last_displayed_qrs = 0
             self._last_displayed_qt  = 0
+            self._last_displayed_qtc = 0
+            # Pending/deadband state must go too, or a held value can be
+            # promoted onto the display one tick after signal returns.
+            self._pending_qrs_value = None
+            self._pending_qt_value = None
+            for _attr in ('last_qrs_axis', 'last_p_axis', 'last_t_axis',
+                          'last_rv5', 'last_sv1', 'last_rv5_sv1'):
+                if hasattr(self, _attr):
+                    setattr(self, _attr, 0)
             # Clear smoothing buffers so they don’t re-inject old values
             for _buf in ('_pr_smooth_buffer_tl', '_qrs_smooth_buffer', '_qt_smooth_buffer'):
                 if hasattr(self, _buf):
@@ -2425,12 +2550,10 @@ class ECGTestPage(QWidget):
             except Exception:
                 pass
             try:
+                # Clears the held values AND their freshness timestamps, so a
+                # pre-arrest number cannot be echoed back for the hold window.
                 from .ui import display_updates as _du
-                for _key in (
-                    'heart_rate', 'pr_interval', 'qrs_duration',
-                    'qt_interval', 'qtc_interval', 'rr_interval', 'p_duration'
-                ):
-                    _du._last_valid.pop(_key, None)
+                _du.reset_metric_holds()
             except Exception:
                 pass
             # Push zeros to the display
@@ -2454,6 +2577,10 @@ class ECGTestPage(QWidget):
                 pass
             return
         
+        # Real signal is present again.
+        self._asystole_active = False
+        self._flatline_logged = False
+
         # Get sampling rate
         # Hardware stream is fixed 500 Hz. Keep calculations locked to configured rate
         # to avoid metric/wave instability when UI focus changes and measured UI rate dips.
@@ -2638,6 +2765,28 @@ class ECGTestPage(QWidget):
         # are found in the current window.
         rr_ms = getattr(self, 'last_rr_interval', 1000.0)
 
+        # ── Rate below the measurable floor ──────────────────────────────────
+        # The analysis window is HISTORY_LENGTH samples (20 s at 500 Hz) and at
+        # least two R-peaks are needed for one RR interval, so the slowest rate
+        # this window can express is about 3 bpm — and the metrics pipeline
+        # requires three peaks, i.e. roughly 9 bpm.
+        #
+        # Below that there IS cardiac activity (visible QRS complexes) but it
+        # cannot be measured here. That is a third state, distinct from both a
+        # flat trace and a disconnected lead, and the report must not describe
+        # it as "no data / please connect device" — the device is working and
+        # the patient has a rhythm, just a profoundly slow one.
+        self._rate_below_measurable = bool(0 < len(r_peaks) < 3)
+        if self._rate_below_measurable and not getattr(self, '_low_rate_logged', False):
+            _secs = len(lead_ii_data) / fs if fs else 0.0
+            print(
+                f" RATE BELOW MEASURABLE RANGE: only {len(r_peaks)} R-peak(s) in a "
+                f"{_secs:.0f}s window (>=3 needed, i.e. ~9 bpm). Metrics report 0."
+            )
+            self._low_rate_logged = True
+        elif not self._rate_below_measurable:
+            self._low_rate_logged = False
+
         if len(r_peaks) >= 2:
             # Calculate RR intervals from consecutive R-peaks
             rr_intervals_ms = np.diff(r_peaks) / fs * 1000.0
@@ -2761,15 +2910,27 @@ class ECGTestPage(QWidget):
             else:
                 self.last_heart_rate = local_bpm
             
-            # Still update display (with old or 0 for clinical metrics)
-            # This ensures the 10 BPM shows up even if PR/QRS are still "--"
+            # No median beat means no clinical intervals from this window. The
+            # previous values may stand in briefly — one noisy window should not
+            # blank the display — but they expire, otherwise a sustained
+            # inability to measure is shown as a live measurement. This is the
+            # path a Fluke at 3 bpm takes on every tick: PR 158 / QRS 81 /
+            # QT 338 were re-published indefinitely after the rate changed.
+            self.pr_interval        = self._hold_or_zero('pr_interval', 0)
+            self.last_qrs_duration  = self._hold_or_zero('last_qrs_duration', 0)
+            self.last_qt_interval   = self._hold_or_zero('last_qt_interval', 0)
+            self.last_qtc_interval  = self._hold_or_zero('last_qtc_interval', 0)
+            self.last_p_duration    = self._hold_or_zero('last_p_duration', 0)
+            self._last_displayed_qt  = self.last_qt_interval
+            self._last_displayed_qtc = self.last_qtc_interval
+
             self.update_ecg_metrics_display(
                 self.last_heart_rate,
-                getattr(self, 'pr_interval', 0),
-                getattr(self, 'last_qrs_duration', 0),
-                getattr(self, 'last_p_duration', 0),
-                getattr(self, '_last_displayed_qt', 0),
-                getattr(self, '_last_displayed_qtc', 0),
+                self.pr_interval,
+                self.last_qrs_duration,
+                self.last_p_duration,
+                self._last_displayed_qt,
+                self._last_displayed_qtc,
                 0,
                 force_immediate=True,
                 rr_interval=getattr(self, 'last_rr_interval', 0),  # FIX-D1
@@ -2853,6 +3014,11 @@ class ECGTestPage(QWidget):
         # This keeps BPM, RR, QT and QTc internally consistent and aligned with
         # reference software that uses median RR from detected beats.
         self.last_heart_rate = heart_rate_raw
+        if heart_rate_raw and heart_rate_raw > 0:
+            if not hasattr(self, '_metric_hold_at'):
+                self._metric_hold_at = {}
+            import time as _t
+            self._metric_hold_at['last_heart_rate'] = _t.monotonic()
 
         # FIX-HR-STAB: heart_rate_raw already comes from calculate_hr_rr()
         # (via user_metrics) or local R-peak detection, both of which apply
@@ -2902,7 +3068,7 @@ class ECGTestPage(QWidget):
         # FIX-TL1: Stabilization — hold last good PR. Do NOT fabricate a formula-based
         # value: a fake PR poisons the EMA buffer and shows wrong values for several seconds.
         if pr_interval_raw is None or pr_interval_raw <= 0:
-            pr_interval_raw = getattr(self, 'pr_interval', 0)
+            pr_interval_raw = self._hold_or_zero('pr_interval', 0)
             # If still 0 at startup, leave as 0 — display will show "--" until real signal arrives.
         
         # FIX-TL4: `calculate_all_ecg_metrics()` already stabilizes PR.  A second
@@ -2954,7 +3120,7 @@ class ECGTestPage(QWidget):
         
         # Hold last good QRS if current frame fails
         if qrs_duration_raw is None or qrs_duration_raw <= 0:
-            qrs_duration_raw = getattr(self, 'last_qrs_duration', 0)
+            qrs_duration_raw = self._hold_or_zero('last_qrs_duration', 0)
         
         # REAL MODE: Smooth QRS with 15-beat median buffer to eliminate noise jitter
         if not hasattr(self, '_qrs_smooth_buffer'):
@@ -3024,7 +3190,7 @@ class ECGTestPage(QWidget):
             qt_interval_raw = user_metrics["qt_interval"]
         # Stabilization: hold last good QT if new one fails
         if qt_interval_raw is None or qt_interval_raw <= 0:
-            qt_interval_raw = getattr(self, 'last_qt_interval', 0)
+            qt_interval_raw = self._hold_or_zero('last_qt_interval', 0)
         
         # STABILIZATION: Smooth QT with buffer (same as QRS/PR)
         if not hasattr(self, '_qt_smooth_buffer'):
@@ -5770,7 +5936,18 @@ class ECGTestPage(QWidget):
             self.recording_start_time = time.time()
             self.recording_timer = QTimer()
             self.recording_timer.timeout.connect(self.capture_frame)
-            self.recording_timer.start(33)  # ~30 FPS target
+            _rec_interval_ms = 33  # ~30 FPS target
+            self.recording_timer.start(_rec_interval_ms)
+
+            # Give the frame buffer a hard cap now that the frame rate is known.
+            # Without a maxlen this list grew at ~187 MB/s and took the machine
+            # into swap, which stalls the serial drain sharing this thread.
+            _fps = max(1, int(round(1000.0 / max(1, _rec_interval_ms))))
+            _max_frames = max(60, _fps * int(getattr(self, '_RECORDING_MAX_SECONDS', 120)))
+            self.recording_frames = deque(maxlen=_max_frames)
+            self._recording_frame_shape = None
+            print(f" Recording buffer capped at {_max_frames} frames "
+                  f"(~{_max_frames / _fps:.0f}s at {_fps} fps)")
 
             # Show notification as recording started
             QMessageBox.information(self, self.tr("Success"), self.tr("Recording started"))
@@ -5843,9 +6020,34 @@ class ECGTestPage(QWidget):
                 ptr.setsize(height * width * 4)
                 arr = np.frombuffer(ptr, np.uint8).reshape((height, width, 4))
                 arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-                
-                # Store frame
-                self.recording_frames.append(arr)
+
+                # Downscale wide grabs before they are held in memory. A 1920-wide
+                # frame is 6.22 MB; at 1280 it is 2.76 MB, and the recording is a
+                # screen capture for review, not a diagnostic artefact.
+                max_w = int(getattr(self, '_RECORDING_MAX_WIDTH', 1280))
+                if max_w and arr.shape[1] > max_w:
+                    scale = max_w / float(arr.shape[1])
+                    arr = cv2.resize(
+                        arr,
+                        (max_w, max(2, int(round(arr.shape[0] * scale)))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    # cv2.VideoWriter needs even dimensions for most codecs.
+                    if arr.shape[0] % 2:
+                        arr = arr[:-1, :, :]
+
+                # Every frame in one recording must have identical dimensions or
+                # cv2.VideoWriter silently writes a corrupt file. The window can be
+                # resized mid-recording, so the first frame's geometry is pinned and
+                # everything after is forced to match it.
+                _shape = getattr(self, '_recording_frame_shape', None)
+                if _shape is None:
+                    self._recording_frame_shape = (arr.shape[1], arr.shape[0])  # (w, h)
+                elif (arr.shape[1], arr.shape[0]) != _shape:
+                    arr = cv2.resize(arr, _shape, interpolation=cv2.INTER_AREA)
+
+                # Bounded store — the deque drops the oldest frame at maxlen.
+                self.recording_frames.append(np.ascontiguousarray(arr))
                 
         except Exception as e:
             print(f"Frame capture error: {e}")
@@ -7015,9 +7217,13 @@ class ECGTestPage(QWidget):
         print(f" Serial connection established successfully on {port_to_use}!")
 
         # ── Start timers (was right after serial_reader.start() in original code) ──
-        timer_interval = 30  # ~33 FPS keeps redraws steadier on slower systems
+        # Match the cadence the HRV and hyperkalemia pages already use. This page
+        # is the heaviest of the three and was the only one with bare literals,
+        # so on a weak machine it ran the most expensive callbacks the fastest.
+        timer_interval = 50 if is_low_spec_mode() else 30   # ~20 / ~33 FPS
+        self._metrics_base_interval = 500 if is_low_spec_mode() else 200
         self.timer.start(timer_interval)
-        self.metrics_timer.start(200)
+        self.metrics_timer.start(self._metrics_base_interval)
         QTimer.singleShot(10, self.update_plots)   # instant first frame
 
         # ── Start HolterBPMController (stable BPM engine) ─────────────────────
@@ -7171,10 +7377,27 @@ class ECGTestPage(QWidget):
                         pass
             return
 
+        _t0 = time.perf_counter()
         try:
             self.calculate_ecg_metrics()
             if hasattr(self, 'last_heart_rate') and self.last_heart_rate > 0:
                 self._last_calculated_bpm = self.last_heart_rate
+        except Exception:
+            pass
+
+        # Never own more than a quarter of our own period. Metrics are a 5 Hz
+        # cosmetic readout over a 20 s window; the plot timer sharing this thread
+        # is what the user actually watches. If the callback costs 90 ms it is
+        # rescheduled at 360 ms rather than 200 ms, so it stops deleting plot
+        # frames on a machine that cannot afford it. The same duty-cycle idiom is
+        # used for the global QRS refresh in ecg_calculations.py.
+        try:
+            _elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+            _base = int(getattr(self, '_metrics_base_interval', 200))
+            _want = max(_base, int(_elapsed_ms / 0.25))
+            _want = min(_want, 2000)          # never slower than 0.5 Hz
+            if abs(_want - self.metrics_timer.interval()) >= 50:
+                self.metrics_timer.setInterval(_want)
         except Exception:
             pass
 
@@ -8013,7 +8236,15 @@ class ECGTestPage(QWidget):
         is_flatline = (lead_ii_snap.size < int(fs * 2.0)) or (np.std(lead_ii_snap) < 0.1) or (frozen.get('HR', 0) <= 0)
 
         if is_flatline:
-            conc_list = ["No ECG data available"]
+            # Three distinct states, not one. Telling the operator to check a
+            # cable while the patient has no cardiac output sends them after
+            # equipment that is working correctly.
+            if getattr(self, '_asystole_active', False):
+                conc_list = ["No cardiac activity detected"]
+            elif getattr(self, '_rate_below_measurable', False):
+                conc_list = ["Rate below measurable range"]
+            else:
+                conc_list = ["No ECG data available"]
             frozen['HR'] = 0
             frozen['RR'] = 0
             frozen['PR'] = 0
@@ -8093,6 +8324,56 @@ class ECGTestPage(QWidget):
                     conc_list.insert(0, f"Borderline QTc ({qtc_for_warning} ms)")
         except Exception:
             pass
+
+        # ── Findings allow-list ─────────────────────────────────────────────
+        # This is the generator the 12-lead page actually uses, so the
+        # restriction has to be applied HERE. It was previously only in
+        # ecg_report_generator.generate_ecg_report(), which this path never
+        # calls — so classifier labels such as "Asystole" still reached the PDF.
+        #
+        # Status lines ("No cardiac activity detected", "Rate below measurable
+        # range", "No ECG data available") are not findings and are preserved.
+        try:
+            from .ecg_report_generator import restrict_to_allowed_conclusions
+            _status_lines = {
+                "No cardiac activity detected",
+                "Rate below measurable range",
+                "No ECG data available",
+                "Please connect device",
+            }
+            _status = [c for c in conc_list if c in _status_lines]
+
+            # The QTc entries carry their measured value, e.g.
+            # "Prolonged QTc (470 ms)" — strip it so a real finding is not
+            # dropped for wording, then let the allow-list supply the canonical
+            # form. "Borderline QTc" is deliberately NOT mapped: 440-459 ms is
+            # below the 460 ms threshold the permitted "Prolonged QTc" means.
+            _canon = []
+            for _c in conc_list:
+                _low = str(_c).lower()
+                if "critically prolonged qtc" in _low or "prolonged qtc" in _low:
+                    _canon.append("Prolonged QTc")
+                else:
+                    _canon.append(_c)
+
+            _findings = restrict_to_allowed_conclusions(_canon)
+            conc_list = _status + [c for c in _findings if c not in _status]
+
+            # Never print an empty conclusion box. If everything the classifier
+            # offered was filtered out but a heart rate WAS measured, state the
+            # rate: that is always reportable and is derived from a number
+            # printed in the same header. This is the path taken when the
+            # classifier returns only a suppressed label — e.g. "Asystole"
+            # alongside a live HR, which is the self-contradiction that started
+            # this work.
+            if not conc_list:
+                _hr = frozen.get('HR', 0) or 0
+                if _hr > 0:
+                    conc_list = ["Sinus Bradycardia" if _hr < 60
+                                 else "Sinus Tachycardia" if _hr > 100
+                                 else "Normal Sinus Rhythm"]
+        except Exception as _allow_err:
+            print(f" Could not apply conclusion allow-list: {_allow_err}")
 
         conc_list = conc_list[:5]   # hard cap at 5
 
@@ -8748,7 +9029,13 @@ class ECGTestPage(QWidget):
             
             # Create line with initial data
             line, = ax.plot(np.arange(self.buffer_size), [np.nan]*self.buffer_size, color="#00ff00", lw=0.7)
-            line.set_clip_on(False)
+            # Clipping stays ON. With ylim pinned to the full 0-4095 ADC range and
+            # the +2048 centering, a normal R-wave at 20 mm/mV reaches ~4248 and,
+            # unclipped, paints straight into the lane of the lead above it —
+            # measured 51 spilled pixels at 20 mm/mV and 514 at 40 mm/mV. That
+            # overlap is the "cluttered" trace: one lead's R-waves appearing in
+            # another lead's row. If a taller trace is wanted, widen the y-limits
+            # or clamp the data; do not let it draw outside its own axes.
             self._overlay_axes.append(ax)
             self._overlay_lines.append(line)
         
@@ -9654,7 +9941,13 @@ class ECGTestPage(QWidget):
             
             # Create line with initial data
             line, = ax.plot(np.arange(self.buffer_size), [np.nan]*self.buffer_size, color="#00ff00", lw=0.7)
-            line.set_clip_on(False)
+            # Clipping stays ON. With ylim pinned to the full 0-4095 ADC range and
+            # the +2048 centering, a normal R-wave at 20 mm/mV reaches ~4248 and,
+            # unclipped, paints straight into the lane of the lead above it —
+            # measured 51 spilled pixels at 20 mm/mV and 514 at 40 mm/mV. That
+            # overlap is the "cluttered" trace: one lead's R-waves appearing in
+            # another lead's row. If a taller trace is wanted, widen the y-limits
+            # or clamp the data; do not let it draw outside its own axes.
             self._overlay_axes.append(ax)
             self._overlay_lines.append(line)
         
@@ -9674,7 +9967,13 @@ class ECGTestPage(QWidget):
             
             # Create line with initial data
             line, = ax.plot(np.arange(self.buffer_size), [np.nan]*self.buffer_size, color="#00ff00", lw=0.7)
-            line.set_clip_on(False)
+            # Clipping stays ON. With ylim pinned to the full 0-4095 ADC range and
+            # the +2048 centering, a normal R-wave at 20 mm/mV reaches ~4248 and,
+            # unclipped, paints straight into the lane of the lead above it —
+            # measured 51 spilled pixels at 20 mm/mV and 514 at 40 mm/mV. That
+            # overlap is the "cluttered" trace: one lead's R-waves appearing in
+            # another lead's row. If a taller trace is wanted, widen the y-limits
+            # or clamp the data; do not let it draw outside its own axes.
             self._overlay_axes.append(ax)
             self._overlay_lines.append(line)
         
@@ -10575,6 +10874,12 @@ class ECGTestPage(QWidget):
                             self._last_packet_count = current_packet_count
                             self._last_packet_time = current_time
                     
+                    # One list per lead for this tick, committed with a single
+                    # slice assignment per lead once the batch is consumed. Every
+                    # sample is kept; this defers the copy, it never drops or
+                    # reorders a sample.
+                    _staged = [[] for _ in range(len(self.data))]
+
                     for packet in packets:
                         self._lead_data_received = True
                         # Packet contains all 12 leads: I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6
@@ -10652,6 +10957,10 @@ class ECGTestPage(QWidget):
                         # ── RA/RL electrode disconnected: alert the user and return to the
                         # outer dashboard, rather than silently letting the trace flatline. ──
                         if _newly_latched:
+                            # Commit what this tick already staged BEFORE tearing the
+                            # page down, so samples that arrived ahead of the
+                            # disconnect are not lost with the rest of the batch.
+                            self._flush_staged_samples(_staged)
                             self._handle_ra_rl_disconnect()
                             # The page/state was just torn down (acquisition stopped and we
                             # navigated away); stop processing any remaining packets from
@@ -10693,10 +11002,10 @@ class ECGTestPage(QWidget):
                                         self._lead_connection_state[lead_name] = True
                                         if not was_connected:
                                             self._on_lead_reconnected(i, lead_name, write_value)
-                                    # Update circular buffer
-                                    self.data[i] = np.roll(self.data[i], -1)
-                                    # Store raw data (filtering happens during display)
-                                    self.data[i][-1] = write_value
+                                    # Stage for this tick's block write (see
+                                    # _append_block). Raw value; filtering happens
+                                    # at display time, exactly as before.
+                                    _staged[i].append(write_value)
                                     if hasattr(self, "_report_buffers") and i < len(self._report_buffers):
                                         self._report_buffers[i].append(write_value)
                                     if hasattr(self, "_replay_buffers") and i < len(self._replay_buffers):
@@ -10750,6 +11059,9 @@ class ECGTestPage(QWidget):
                         
                         packets_processed += 1
                         
+                    # One block write per lead for the whole tick.
+                    self._flush_staged_samples(_staged)
+
                 except Exception as e:
                     print(f" Error reading serial packets: {e}")
                     if hasattr(self, 'serial_reader') and hasattr(self.serial_reader, '_handle_serial_error'):
@@ -10782,9 +11094,11 @@ class ECGTestPage(QWidget):
                             for i in range(len(self.leads)):
                                 try:
                                     if i < len(self.data) and i < len(all_12_leads):
-                                        self.data[i] = np.roll(self.data[i], -1)
-                                        # Store raw data (filtering happens during display)
-                                        self.data[i][-1] = all_12_leads[i]
+                                        # Same block-append rule as the packet path.
+                                        # Bounded to 20 lines per tick here so the win
+                                        # is small, but leaving one np.roll behind
+                                        # invites the pattern back.
+                                        self._append_block(self.data[i], (all_12_leads[i],))
                                         if hasattr(self, "_report_buffers") and i < len(self._report_buffers):
                                             self._report_buffers[i].append(float(all_12_leads[i]))
                                         if hasattr(self, "_replay_buffers") and i < len(self._replay_buffers):
@@ -10814,6 +11128,19 @@ class ECGTestPage(QWidget):
             if not render_now:
                 return
             if getattr(self, "_grid_frozen", False):
+                return
+            if getattr(self, "_overlay_active", False):
+                # The 12:1 / 6:2 overlay hides the pyqtgraph plot area and drives
+                # its own matplotlib canvas from _overlay_timer. Without this the
+                # 30 ms timer kept running the whole filter / interpolate / setData
+                # chain for twelve curves into widgets Qt never paints — pure waste
+                # competing with a matplotlib redraw measured at 44 ms.
+                #
+                # This return is placed deliberately AFTER the packet drain and the
+                # buffer writes above. Stopping self.timer instead would also stop
+                # read_packets(), the Holter writer push and the BPM push, which all
+                # live in this same callback — the overlay would silently stop
+                # recording. Skip the render, never the acquisition.
                 return
             has_any_data = any(len(self.data[i]) > 0 and np.any(self.data[i] != 0) for i in range(min(len(self.data), len(self.leads))))
             if packets_processed > 0 or has_any_data:

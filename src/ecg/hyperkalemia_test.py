@@ -346,28 +346,75 @@ class HyperkalemiaTestWindow(QWidget):
         except Exception:
             return np.asarray(signal, dtype=float)
 
-    def _apply_lead_off_verdict(self, lead_name, looks_off):
+    def _apply_lead_off_verdict(self, lead_name, looks_off, samples=1):
         """
         Latch a lead-off verdict only after it holds for a sustained stretch.
 
         Blanking a lead replaces its samples with a constant in the display, the
         analysis buffer and the recording, so momentary agreement from the
         detector — a motion artifact, a noisy beat — must not be enough to do it.
+
+        `samples` is how many samples this verdict stands for. The verdict is now
+        computed once per timer tick rather than once per sample, so the counters
+        advance by the tick's sample count instead of by one. That keeps the
+        thresholds in SAMPLE units, which is what makes the 0.5 s engage / 0.2 s
+        release timing survive a change of timer interval or a low-spec machine
+        running a longer tick — converting them to tick counts would silently
+        retune the debounce on exactly the machines this work is meant to help.
         """
         engage = int(getattr(self, "_LEAD_OFF_ENGAGE_PACKETS", 250))
         release = int(getattr(self, "_LEAD_OFF_RELEASE_PACKETS", 100))
         currently_off = bool(self._lead_off_state.get(lead_name, False))
+        step = max(1, int(samples))
 
         if looks_off:
             self._lead_off_off_count[lead_name] = 0
-            self._lead_off_on_count[lead_name] = self._lead_off_on_count.get(lead_name, 0) + 1
+            self._lead_off_on_count[lead_name] = self._lead_off_on_count.get(lead_name, 0) + step
             if not currently_off and self._lead_off_on_count[lead_name] >= engage:
                 self._lead_off_state[lead_name] = True
         else:
             self._lead_off_on_count[lead_name] = 0
-            self._lead_off_off_count[lead_name] = self._lead_off_off_count.get(lead_name, 0) + 1
+            self._lead_off_off_count[lead_name] = self._lead_off_off_count.get(lead_name, 0) + step
             if currently_off and self._lead_off_off_count[lead_name] >= release:
                 self._lead_off_state[lead_name] = False
+
+    def _evaluate_lead_off_windows(self, samples_this_tick):
+        """Run the lead-off detector once per lead, once per timer tick.
+
+        Called after the packet loop. Twelve analyses per tick (~400/s) instead
+        of twelve per sample (6000/s), on windows that received every sample.
+
+        The `>= window_len` guard matters: detect_lead_off() returns False
+        unconditionally until the window is full (lead_off_detection.py), so a
+        shorter window bought a guaranteed-False answer at the price of copying
+        the deque into a float64 array.
+        """
+        if samples_this_tick <= 0:
+            return
+        fs = float(self.sampling_rate or 500.0)
+        if fs < 100.0 or fs > 1000.0:
+            fs = 500.0
+        full = int(fs)  # detector needs a whole 1 s window before it decides
+
+        for lead_name in self.lead_indices.keys():
+            # A disconnected lead is already latched off by the packet loop; its
+            # window holds stale values and must not be re-judged.
+            if not self._lead_connection_state.get(lead_name, True):
+                continue
+            w = self._lead_off_windows.get(lead_name)
+            if w is None or len(w) < full:
+                continue
+            try:
+                looks_off = bool(
+                    detect_lead_off(
+                        np.asarray(w, dtype=float),
+                        sampling_rate=fs,
+                        window_size=1.0,
+                    )
+                )
+                self._apply_lead_off_verdict(lead_name, looks_off, samples=samples_this_tick)
+            except Exception:
+                continue
 
     def _init_plot_and_lead_off_buffers(self):
         # Keep a slightly larger buffer than the visible window for stable filtering.
@@ -1302,6 +1349,10 @@ class HyperkalemiaTestWindow(QWidget):
             
             n_new = len(packets)
             # Process each packet
+            # One list per calculator lead for this tick.
+            _staged_calc = [[] for _ in range(len(self.ecg_calculator.data))] \
+                if self.ecg_calculator else []
+
             for packet in packets:
                 # Ring size directly — len(self.data) would rebuild the whole
                 # chronological array on every packet just to read its length.
@@ -1341,29 +1392,26 @@ class HyperkalemiaTestWindow(QWidget):
                                     self._lead_off_on_count[lead_name] = 0
                                     self._lead_off_off_count[lead_name] = 0
 
-                                # Lead-off detection (same thresholds used by 12-lead) on connected
-                                # streams, debounced so one window cannot blank the lead.
-                                try:
-                                    w = self._lead_off_windows.get(lead_name)
-                                    if w is not None:
-                                        w.append(raw_value)
-                                        if len(w) >= 50:
-                                            looks_off = bool(
-                                                detect_lead_off(
-                                                    np.asarray(w, dtype=float),
-                                                    sampling_rate=float(self.sampling_rate or 500.0),
-                                                    window_size=1.0
-                                                )
-                                            )
-                                            self._apply_lead_off_verdict(lead_name, looks_off)
-                                except Exception:
-                                    pass
+                                # Feed the lead-off window. This is O(1) and must stay
+                                # per-sample so the window itself is exact. The verdict is
+                                # NOT computed here — detect_lead_off() analyses the whole
+                                # 500-sample window (ptp, var, diff, flatnonzero, median),
+                                # and running that once per lead per sample was 6000 full
+                                # analyses per second on the GUI thread: measured 337 ms of
+                                # work per second of hardware data, 91% of this entire write
+                                # loop. It now runs once per timer tick in
+                                # _evaluate_lead_off_windows() below.
+                                w = self._lead_off_windows.get(lead_name)
+                                if w is not None:
+                                    w.append(raw_value)
 
                                 value_for_buffers = self._adc_center if bool(self._lead_off_state.get(lead_name, False)) else raw_value
 
-                            # 1. ANALYSIS DATA (RAW/flat on OFF)
-                            self.ecg_calculator.data[idx] = np.roll(self.ecg_calculator.data[idx], -1)
-                            self.ecg_calculator.data[idx][-1] = value_for_buffers
+                            # 1. ANALYSIS DATA (RAW/flat on OFF) — staged for this
+                            # tick's block write. np.roll rebuilt a 40 KB array per
+                            # lead per sample; the display ring beside it already
+                            # avoided that, and now the calculator buffer does too.
+                            _staged_calc[idx].append(value_for_buffers)
 
                             # Store capture data for reports/analysis (bounded plotting is separate)
                             if lead_name in self.lead_data:
@@ -1386,6 +1434,21 @@ class HyperkalemiaTestWindow(QWidget):
                             print(f" Error updating lead {lead_name}: {e}")
                             continue
             
+            # One block write per lead for the whole tick.
+            if self.ecg_calculator and _staged_calc:
+                for _i, _vals in enumerate(_staged_calc):
+                    if _vals and _i < len(self.ecg_calculator.data):
+                        try:
+                            ECGTestPage._append_block(self.ecg_calculator.data[_i], _vals)
+                        except Exception as _e:
+                            print(f' Error flushing calculator lead {_i}: {_e}')
+
+            # One lead-off pass for the whole tick — see _evaluate_lead_off_windows().
+            try:
+                self._evaluate_lead_off_windows(len(packets))
+            except Exception as _lo_err:
+                print(f" Lead-off evaluation error: {_lo_err}")
+
             # Update sampling rate counter
             if self.ecg_calculator and hasattr(self.ecg_calculator, "sampler"):
                 sr = 0.0

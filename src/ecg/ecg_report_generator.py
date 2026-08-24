@@ -1666,13 +1666,134 @@ def _has_abnormal_conclusion(conclusions):
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# REPORT CONCLUSION ALLOW-LIST
+# ══════════════════════════════════════════════════════════════════════════════
+# The printed CONCLUSION box carries these five findings and nothing else.
+#
+# They share one property: each is derived directly from a measured value that
+# is also printed in the report header (HR, QRS, QTc), so a reader can check the
+# conclusion against the numbers on the same page. The morphology- and
+# rhythm-classifier labels are deliberately excluded — those detectors proved
+# unreliable in the field (a normal 65 bpm sinus ECG was reported as
+# "Ventricular Fibrillation"), and a wrong lethal label on a signed report is
+# worse than no label.
+#
+# CONSEQUENCE, STATED PLAINLY: the report will not name Asystole, Ventricular
+# Fibrillation, Ventricular Tachycardia, Atrial Fibrillation/Flutter, AV block
+# or bundle branch block even when the analyser detects them. The waveform is
+# still printed in full and the intervals are still measured and shown; the
+# interpretation of anything beyond rate, QRS width and QTc is left to the
+# reading clinician.
+REPORT_ALLOWED_CONCLUSIONS = (
+    "Normal Sinus Rhythm",
+    "Sinus Bradycardia",
+    "Sinus Tachycardia",
+    "Wide QRS",
+    "Prolonged QTc",
+)
+
+# Different spellings of the SAME permitted finding are folded in rather than
+# dropped, so a real finding is never lost to wording alone.
+_CONCLUSION_CANONICAL = {
+    "normal sinus rhythm": "Normal Sinus Rhythm",
+    "sinus rhythm": "Normal Sinus Rhythm",          # emitted when P waves undetected
+    "nsr": "Normal Sinus Rhythm",
+    "sinus bradycardia": "Sinus Bradycardia",
+    "bradycardia": "Sinus Bradycardia",
+    "athlete bradycardia": "Sinus Bradycardia",
+    "sinus tachycardia": "Sinus Tachycardia",
+    "tachycardia": "Sinus Tachycardia",
+    "wide qrs": "Wide QRS",
+    "wide qrs complex": "Wide QRS",
+    "prolonged qtc": "Prolonged QTc",
+    "prolonged qtc interval": "Prolonged QTc",
+    "long qt syndrome": "Prolonged QTc",            # QTc > 500 is still prolonged
+    "prolonged qtcf interval (fridericia)": "Prolonged QTc",
+}
+
+
+def restrict_to_allowed_conclusions(conclusions):
+    """Fold spelling variants, then keep only the permitted findings.
+
+    Order is preserved: rhythm first (it is always produced first), then Wide
+    QRS, then Prolonged QTc — matching REPORT_ALLOWED_CONCLUSIONS.
+    """
+    kept = []
+    for item in conclusions or []:
+        text = str(item).strip()
+        if not text or text == "---":
+            continue
+        canonical = _CONCLUSION_CANONICAL.get(text.lower(), text)
+        if canonical in REPORT_ALLOWED_CONCLUSIONS and canonical not in kept:
+            kept.append(canonical)
+    order = {label: i for i, label in enumerate(REPORT_ALLOWED_CONCLUSIONS)}
+    kept.sort(key=lambda c: order[c])
+    return kept
+
+
+def ensure_rate_conclusion(conclusions, data):
+    """Guarantee the box always states the rate finding when HR is measurable.
+
+    The rhythm rules are an if/elif chain whose first matches are labels the
+    allow-list removes — e.g. HR < 40 with no measurable PR yields
+    "Third-degree AV Block". Filtering that left a profoundly bradycardic
+    patient with a completely EMPTY conclusion box, which reads as "nothing
+    found" rather than "we are not reporting that class of finding".
+
+    The rate itself is always reportable, so it is restated here. Note this
+    uses the same wording the chain already uses at HR 40-59 with no PR
+    ("Sinus Bradycardia"), so it introduces no claim the rules were not
+    already making.
+    """
+    rhythm_labels = ("Normal Sinus Rhythm", "Sinus Bradycardia", "Sinus Tachycardia")
+    if any(c in rhythm_labels for c in (conclusions or [])):
+        return list(conclusions or [])
+
+    hr = 0.0
+    for key in ("HR_bpm", "Heart_Rate", "HR", "beat", "HR_avg"):
+        try:
+            raw = (data or {}).get(key)
+            if raw is not None and str(raw).strip() != "":
+                hr = float(str(raw).lower().replace("bpm", "").strip())
+                break
+        except Exception:
+            continue
+
+    if hr <= 0:
+        return list(conclusions or [])
+
+    if hr < 60:
+        label = "Sinus Bradycardia"
+    elif hr > 100:
+        label = "Sinus Tachycardia"
+    else:
+        label = "Normal Sinus Rhythm"
+    return [label] + list(conclusions or [])
+
+
 def _normalize_report_conclusions(conclusions):
     """Normalize report conclusions so real arrhythmias beat metric fallbacks."""
     expanded = []
     for item in conclusions or []:
         expanded.extend(_split_conclusion_text(item))
 
-    abnormal = _has_abnormal_conclusion(expanded)
+    # Only a finding that will ACTUALLY BE PRINTED may suppress the rhythm line.
+    #
+    # Without this, a QRS of 116 ms produced an empty conclusion box: it raised
+    # "Borderline Wide QRS", which set abnormal=True and dropped "Normal Sinus
+    # Rhythm", and the allow-list then removed Borderline Wide QRS as well —
+    # leaving nothing at all on the report.
+    #
+    # Wide QRS and Prolonged QTc are also excluded from the decision. They are
+    # conduction/repolarisation findings, not competing rhythm diagnoses, so
+    # "Normal Sinus Rhythm" plus "Wide QRS" is a coherent pair and the rhythm
+    # should still be stated. Within the permitted set the rhythm labels are
+    # mutually exclusive anyway, so nothing else can contradict it.
+    _printable_now = restrict_to_allowed_conclusions(expanded)
+    abnormal = _has_abnormal_conclusion(
+        [c for c in _printable_now if c not in ("Wide QRS", "Prolonged QTc")]
+    )
     drop_when_abnormal = {
         "Normal Sinus Rhythm",
         "Normal sinus rhythm",
@@ -1772,7 +1893,11 @@ def _normalize_report_conclusions(conclusions):
         return priority.index(label) if label in priority else len(priority)
 
     cleaned.sort(key=_rank)
-    return cleaned
+
+    # Final gate: the printed conclusion carries only the permitted findings.
+    # Applied here because every conclusion source in this module funnels
+    # through this function, so no path can bypass it.
+    return restrict_to_allowed_conclusions(cleaned)
 
 
 def _build_metric_conclusions(data):
@@ -2290,6 +2415,21 @@ def generate_ecg_report(
     if not dashboard_conclusions:
         dashboard_conclusions = get_dashboard_conclusions_from_image(dashboard_instance)
 
+    # The permitted findings are all derived from measured values, so derive them
+    # here unconditionally and merge. Previously the value rules ran only as a
+    # last-resort fallback: a report measuring QRS 116 ms printed no QRS finding
+    # because an earlier source had already supplied a rhythm label and won.
+    # restrict_to_allowed_conclusions() de-duplicates, so merging is safe.
+    try:
+        dashboard_conclusions = _normalize_report_conclusions(
+            list(dashboard_conclusions or []) + _build_metric_conclusions(data or {})
+        )
+        # The rate finding is always reportable; never leave the box blank
+        # just because the rhythm label the rules picked is not printable.
+        dashboard_conclusions = ensure_rate_conclusion(dashboard_conclusions, data or {})
+    except Exception as _mc_err:
+        print(f" Could not derive value-based conclusions: {_mc_err}")
+
     # SAFEGUARD: If there is no real data (HR <= 0 or all core metrics are zero), ignore any
     # persisted conclusions from last_conclusions.json and show explicit "No ECG data available" instead.
     try:
@@ -2314,21 +2454,62 @@ def generate_ecg_report(
         is_no_data = (hr_val <= 0) or (hr_val == 0 and pr_val == 0 and qrs_val == 0 and qt_val == 0 and qtc_val == 0)
 
         if is_no_data:
-            dashboard_conclusions = [
-                "No ECG data available",
-                "Please connect device"
-            ]
-            print(" Overriding conclusions because HR is 0 or all core metrics are zero (no data)")
+            # Every value reads zero. There are two very different reasons for
+            # that and telling a clinician the wrong one is dangerous:
+            #
+            #   electrodes off   -> a device problem, "please connect device"
+            #   electrodes on,   -> the patient has no cardiac output; telling
+            #   flat trace          them to check the cable is actively harmful
+            #
+            # The 12-lead page distinguishes them and sets _asystole_active.
+            # Neither line is a rhythm diagnosis, so neither is subject to the
+            # findings allow-list — they are status text, like the existing
+            # "No ECG data available".
+            _asystole = False
+            _low_rate = False
+            try:
+                _asystole = bool(getattr(ecg_test_page, "_asystole_active", False))
+                _low_rate = bool(getattr(ecg_test_page, "_rate_below_measurable", False))
+            except Exception:
+                _asystole = _low_rate = False
+
+            if _low_rate and not _asystole:
+                # QRS complexes are present but too far apart for the analysis
+                # window to measure — a profoundly slow rhythm, not a fault and
+                # not a flat line. Saying "please connect device" here would send
+                # the operator after equipment that is working correctly.
+                dashboard_conclusions = [
+                    "Rate below measurable range",
+                    "Review trace - measurements unavailable",
+                ]
+                print(" Rate below measurable range: R-peaks present but too few to measure")
+            elif _asystole:
+                dashboard_conclusions = [
+                    "No cardiac activity detected",
+                    "All measurements zero - review trace",
+                ]
+                print(" Asystole: all metrics zero with electrodes attached")
+            else:
+                dashboard_conclusions = [
+                    "No ECG data available",
+                    "Please connect device",
+                ]
+                print(" Overriding conclusions because HR is 0 or all core metrics are zero (no data)")
         else:
             dashboard_conclusions = [c for c in dashboard_conclusions if "No ECG data available" not in c and "Please connect device" not in c]
             if hr_val <= 0:
                 dashboard_conclusions = [c for c in dashboard_conclusions if "Normal Sinus Rhythm" not in c and "Normal sinus rhythm" not in c]
-            
-            # Merge value-based metric conclusions (BPM, PR, QRS, QTc, LVH) derived directly from data
-            metric_conclusions = _build_metric_conclusions(data)
-            for mc in metric_conclusions:
-                if mc not in dashboard_conclusions:
-                    dashboard_conclusions.append(mc)
+
+            # Merge value-based metric conclusions derived directly from data.
+            #
+            # These MUST go through _normalize_report_conclusions(): appending
+            # them raw bypassed the findings allow-list entirely, so labels that
+            # are meant to be filtered — Third-degree AV Block, Borderline Wide
+            # QRS, First-degree AV Block, Long QT Syndrome — reached the printed
+            # report through this branch.
+            merged = list(dashboard_conclusions) + _build_metric_conclusions(data)
+            dashboard_conclusions = _normalize_report_conclusions(merged)
+            dashboard_conclusions = ensure_rate_conclusion(dashboard_conclusions, data)
     except Exception as e:
         print(f" Safeguard check error: {e}")
 

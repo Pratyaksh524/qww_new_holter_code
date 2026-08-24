@@ -183,10 +183,23 @@ class TestNormalizeConclusions(unittest.TestCase):
         r = self._norm(["Normal Sinus Rhythm", "Normal Sinus Rhythm"])
         self.assertEqual(r.count("Normal Sinus Rhythm"), 1)
 
-    def test_filter_nsr_on_severe_pathology(self):
+    def test_severe_pathology_labels_are_no_longer_printed(self):
+        """Superseded by the report conclusion allow-list.
+
+        This test previously asserted that "Third-degree AV Block" survives and
+        suppresses "Normal Sinus Rhythm". The printed conclusion is now
+        restricted to five value-derived findings (see
+        REPORT_ALLOWED_CONCLUSIONS and tests/test_report_conclusions.py), so
+        classifier labels such as complete heart block no longer reach the PDF
+        at all — the waveform and intervals are printed and their
+        interpretation is left to the reading clinician.
+
+        The rhythm line is therefore what remains, and it is no longer
+        suppressed by a non-printable finding.
+        """
         r = self._norm(["Normal Sinus Rhythm", "Third-degree AV Block"])
-        self.assertIn("Third-degree AV Block", r)
-        self.assertNotIn("Normal Sinus Rhythm", r)
+        self.assertNotIn("Third-degree AV Block", r)
+        self.assertEqual(r, ["Normal Sinus Rhythm"])
 
     def test_empty_returns_empty(self):
         self.assertEqual([], self._norm([]))

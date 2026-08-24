@@ -41,15 +41,59 @@ _LIMITS = {
 # Key: metric_name  →  last valid int (or string for composite fields)
 _last_valid: Dict[str, object] = {}
 
+# When each metric last received a real (non-zero) value.
+# Key: metric_name  →  time.time() of the last good reading
+_last_valid_at: Dict[str, float] = {}
+
+# How long a held value may keep being displayed once the incoming value has
+# gone to zero.
+#
+# The hold exists so a single missed beat or one noisy analysis window does not
+# blank the display. It previously had NO expiry, which meant a genuine change
+# in the patient's rhythm was masked indefinitely: a simulator moved from 72 bpm
+# to 3 bpm and the page still read 71 while every trace was flat. At 3 bpm the
+# 20 s analysis buffer can hold only one R-peak, so the pipeline correctly
+# reported zero — the display was the only thing still claiming 71.
+#
+# 4 s is longer than any plausible single-window dropout at a rate the pipeline
+# can measure at all (it needs 3 R-peaks, i.e. ~9 bpm or faster), and short
+# enough that a real bradycardia or arrest shows up promptly.
+HOLD_MAX_SECONDS: float = 4.0
+
+
+def _hold_is_fresh(key: str) -> bool:
+    """True while `key`'s last good value may still stand in for a zero."""
+    stamp = _last_valid_at.get(key)
+    if stamp is None:
+        return False
+    if (time.time() - stamp) <= HOLD_MAX_SECONDS:
+        return True
+    # Expired — drop it so the display falls through to 0 from now on.
+    _last_valid.pop(key, None)
+    _last_valid_at.pop(key, None)
+    return False
+
+
+def _held(key: str, default=0):
+    """The held value for `key`, or `default` once the hold has expired."""
+    return _last_valid.get(key, default) if _hold_is_fresh(key) else default
+
+
+def reset_metric_holds() -> None:
+    """Forget every held value (used when signal is lost or a page restarts)."""
+    _last_valid.clear()
+    _last_valid_at.clear()
+
 
 def _clamp(key: str, value: int) -> Optional[int]:
     """Return value if within physiological limits, else last valid or None."""
     lo, hi = _LIMITS.get(key, (0, 99999))
     if lo <= value <= hi:
         _last_valid[key] = value
+        _last_valid_at[key] = time.time()
         return value
-    # Out of range — try to return the last good value
-    return _last_valid.get(key, None)
+    # Out of range — stand in with the last good value while the hold is fresh.
+    return _held(key, None)
 
 
 def _clamp_qt_for_hr(qt_ms: int, heart_rate: Optional[float]) -> Optional[int]:
@@ -64,8 +108,9 @@ def _clamp_qt_for_hr(qt_ms: int, heart_rate: Optional[float]) -> Optional[int]:
     qt_max = _LIMITS['qt_interval'][1]
     if qt_min <= qt_ms <= qt_max:
         _last_valid['qt_interval'] = qt_ms
+        _last_valid_at['qt_interval'] = time.time()
         return qt_ms
-    return _last_valid.get('qt_interval', None)
+    return _held('qt_interval', None)
 
 
 def _set_if_changed(label, text: str):
@@ -124,8 +169,12 @@ def update_ecg_metrics_display(
                 hr_val = _clamp('heart_rate', raw_hr)
                 if hr_val and hr_val > 0:
                     _set_if_changed(metric_labels['heart_rate'], f"{hr_val:3d}")
-            elif _last_valid.get('heart_rate', 0) > 0:
-                _set_if_changed(metric_labels['heart_rate'], f"{_last_valid['heart_rate']:3d}")
+            elif _held('heart_rate', 0) > 0:
+                _set_if_changed(metric_labels['heart_rate'], f"{_held('heart_rate'):3d}")
+            else:
+                # Hold expired and nothing new: say zero rather than keep
+                # showing a rate the patient no longer has.
+                _set_if_changed(metric_labels['heart_rate'], "  0")
 
         # ── RR Interval ──────────────────────────────────────────────────────
         if 'rr_interval' in metric_labels:
@@ -134,8 +183,10 @@ def update_ecg_metrics_display(
                 clamped = _clamp('rr_interval', rr_val)
                 if clamped:
                     _set_if_changed(metric_labels['rr_interval'], f"{clamped}")
-            elif _last_valid.get('rr_interval', 0) > 0:
-                _set_if_changed(metric_labels['rr_interval'], f"{_last_valid['rr_interval']}")
+            elif _held('rr_interval', 0) > 0:
+                _set_if_changed(metric_labels['rr_interval'], f"{_held('rr_interval')}")
+            else:
+                _set_if_changed(metric_labels['rr_interval'], "0")
 
         # ── PR Interval ───────────────────────────────────────────────────────
         if 'pr_interval' in metric_labels:
@@ -144,8 +195,10 @@ def update_ecg_metrics_display(
                 pr_val = _clamp('pr_interval', raw_pr)
                 if pr_val and pr_val > 0:
                     _set_if_changed(metric_labels['pr_interval'], f"{pr_val:3d}")
-            elif _last_valid.get('pr_interval', 0) > 0:
-                _set_if_changed(metric_labels['pr_interval'], f"{_last_valid['pr_interval']:3d}")
+            elif _held('pr_interval', 0) > 0:
+                _set_if_changed(metric_labels['pr_interval'], f"{_held('pr_interval'):3d}")
+            else:
+                _set_if_changed(metric_labels['pr_interval'], "  0")
 
         # ── QRS Duration ──────────────────────────────────────────────────────
         if 'qrs_duration' in metric_labels:
@@ -154,8 +207,10 @@ def update_ecg_metrics_display(
                 qrs_val = _clamp('qrs_duration', raw_qrs)
                 if qrs_val and qrs_val > 0:
                     _set_if_changed(metric_labels['qrs_duration'], f"{qrs_val:3d}")
-            elif _last_valid.get('qrs_duration', 0) > 0:
-                _set_if_changed(metric_labels['qrs_duration'], f"{_last_valid['qrs_duration']:3d}")
+            elif _held('qrs_duration', 0) > 0:
+                _set_if_changed(metric_labels['qrs_duration'], f"{_held('qrs_duration'):3d}")
+            else:
+                _set_if_changed(metric_labels['qrs_duration'], "  0")
 
         # ── P Duration ───────────────────────────────────────────────────────
         if 'p_duration' in metric_labels:
@@ -163,8 +218,10 @@ def update_ecg_metrics_display(
                 p_val = _clamp('p_duration', int(round(p_duration)))
                 if p_val:
                     _set_if_changed(metric_labels['p_duration'], f"{p_val}")
-            elif _last_valid.get('p_duration', 0) > 0:
-                _set_if_changed(metric_labels['p_duration'], f"{_last_valid['p_duration']}")
+            elif _held('p_duration', 0) > 0:
+                _set_if_changed(metric_labels['p_duration'], f"{_held('p_duration')}")
+            else:
+                _set_if_changed(metric_labels['p_duration'], "0")
 
         # ── ST ───────────────────────────────────────────────────────────────
         if 'st_interval' in metric_labels:
@@ -190,9 +247,12 @@ def update_ecg_metrics_display(
             if parts:
                 txt = "/".join(parts)
                 _last_valid['qtc_interval'] = txt
+                _last_valid_at['qtc_interval'] = time.time()
                 _set_if_changed(metric_labels['qtc_interval'], txt)
-            elif _last_valid.get('qtc_interval'):
-                _set_if_changed(metric_labels['qtc_interval'], str(_last_valid['qtc_interval']))
+            elif _held('qtc_interval', None):
+                _set_if_changed(metric_labels['qtc_interval'], str(_held('qtc_interval')))
+            else:
+                _set_if_changed(metric_labels['qtc_interval'], "0/0")
 
         return current_time
 
