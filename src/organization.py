@@ -713,8 +713,11 @@ class SignUpDialog(QDialog, BaseDialogMixin):
 
         form.addWidget(_field_label("Phone Number:"))
         self.phone_edit = _text_field("Enter your phone number", max_width=420)
-        self.phone_edit.setValidator(QIntValidator(0, 2147483647, self))
-        self.phone_edit.setMaxLength(10)
+        # QIntValidator(0, 2147483647) refused every keystroke of any number
+        # above 2147483647 — which is most real mobile numbers, since they start
+        # at 6. A digit regex has no integer ceiling.
+        from utils.input_validation import apply_digit_only, PHONE_DIGITS
+        apply_digit_only(self.phone_edit, PHONE_DIGITS)
         form.addWidget(self.phone_edit)
 
         def _toggle_visibility(pwd_field, btn):
@@ -792,23 +795,42 @@ class SignUpDialog(QDialog, BaseDialogMixin):
             QMessageBox.warning(self, "Error", "All fields are required.")
             return
 
-        if not age.isdigit():
-            QMessageBox.warning(self, "Error", "Age must be numbers only.")
-            return
+        # Shared limits — the same rules the login, signup and analysis forms
+        # use, so a value accepted in one place cannot be refused in another.
+        # "at most 10 digits" previously admitted a 1-digit phone number, and
+        # age had no upper bound at all.
+        from utils.input_validation import (
+            validate_age, validate_name, validate_password, validate_phone,
+            validate_text, ADDRESS_MAX_LENGTH,
+        )
 
-        # Enforce numeric phone number with length up to 10 digits
-        if not phone.isdigit() or len(phone) > 10:
-            QMessageBox.warning(self, "Error", "Phone number must be numbers only and at most 10 digits.")
-            return
-        
+        checks = (
+            validate_name(full_name, "Full name"),
+            validate_age(age, "Age"),
+            validate_name(gender, "Gender", min_length=1, max_length=20),
+            validate_text(address, "Address", ADDRESS_MAX_LENGTH),
+            validate_phone(phone),
+        )
+        for ok, _cleaned, err in checks:
+            if not ok:
+                QMessageBox.warning(self, "Error", err)
+                return
+
+        full_name = checks[0][1]
+        age = checks[1][1]
+        gender = checks[2][1]
+        address = checks[3][1]
+        phone = checks[4][1]
+
         if password != confirm_password:
             QMessageBox.warning(self, "Error", "Passwords do not match.")
             return
-        
-        if len(password) < 6:
-            QMessageBox.warning(self, "Error", "Password must be at least 6 characters long.")
+
+        ok_pwd, password, err_pwd = validate_password(password)
+        if not ok_pwd:
+            QMessageBox.warning(self, "Error", err_pwd)
             return
-        
+
         # Store user data
         self.user_data = {
             'full_name': full_name,
@@ -1213,8 +1235,8 @@ class LoginDialog(QDialog, BaseDialogMixin):
 
         phone_edit = QLineEdit()
         phone_edit.setPlaceholderText("Enter your phone number")
-        phone_edit.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,10}"), phone_dialog))
-        phone_edit.setMaxLength(10)
+        from utils.input_validation import apply_digit_only, PHONE_DIGITS
+        apply_digit_only(phone_edit, PHONE_DIGITS)
         phone_edit.returnPressed.connect(lambda: do_phone_login())
         card_layout.addWidget(phone_edit)
 
@@ -2284,8 +2306,10 @@ class DashboardWindow(QDialog):
                     edit.setPlaceholderText(placeholders[key])
 
                 if key == "phone":
-                    edit.setValidator(QIntValidator(0, 2147483647, dialog))
-                    edit.setMaxLength(10)
+                    # Not QIntValidator: its C++ int ceiling rejects every
+                    # keystroke of any number above 2147483647.
+                    from utils.input_validation import apply_digit_only, PHONE_DIGITS
+                    apply_digit_only(edit, PHONE_DIGITS)
 
                 if key == "age":
                     edit.setValidator(QIntValidator(0, 150, dialog))
@@ -3918,8 +3942,10 @@ class UserCreationDialog(QDialog):
                 if field_name == 'confirm_password':
                     field.returnPressed.connect(self.handle_create_user)
                 if field_name == 'phone':
-                    field.setValidator(QIntValidator(0, 2147483647, self))
-                    field.setMaxLength(10)
+                    # Not QIntValidator: its C++ int ceiling rejects every
+                    # keystroke of any number above 2147483647.
+                    from utils.input_validation import apply_digit_only, PHONE_DIGITS
+                    apply_digit_only(field, PHONE_DIGITS)
                 if field_name == 'age':
                     field.setValidator(QIntValidator(0, 150, self))
                     field.setMaxLength(3)

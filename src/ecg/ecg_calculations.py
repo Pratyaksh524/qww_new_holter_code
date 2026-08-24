@@ -59,7 +59,10 @@ from scipy.signal import butter, filtfilt, find_peaks
 
 # ── Internal imports ──────────────────────────────────────────────────────────
 from .signal_paths import display_filter
-from .qrs_detection import qrs_duration_from_raw_signal
+from .qrs_detection import (
+    qrs_duration_from_raw_signal,
+    compute_global_qrs_duration_12lead,
+)
 from .metrics.reference_intervals import lookup_reference_intervals
 from .pre_analysis import pre_analyze, should_analyze
 
@@ -1004,6 +1007,37 @@ def calculate_hr_rr(lead_data: np.ndarray, fs: float = 500.0,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GLOBAL QRS REFRESH THROTTLE
+# ══════════════════════════════════════════════════════════════════════════════
+# Delineating twelve leads costs roughly 30 ms, and the pages drive this entry
+# point from a 200 ms UI-thread timer. Recomputing every tick would spend a
+# sixth of that budget re-measuring a width that moves on the scale of seconds
+# (and is median-smoothed over 15 beats downstream anyway), so the global
+# measurement is refreshed about once a second and reused in between.
+# Keyed by instance_id so the 12-lead, HRV and hyperkalemia pages never share
+# a cache entry — the same reason their smoothing buffers are keyed that way.
+
+# The interval self-tunes: whatever the measurement costs on this machine, it is
+# scheduled to occupy at most ~5% of wall-clock time, clamped to 1-4 s. A fast
+# desktop refreshes every second; a low-spec box backs itself off instead of
+# stuttering the trace.
+_GLOBAL_QRS_REFRESH_SEC: float = 1.0
+_GLOBAL_QRS_MAX_REFRESH_SEC: float = 4.0
+_GLOBAL_QRS_DUTY_CYCLE: float = 0.05
+
+# instance_id -> (timestamp, result, interval_until_next_refresh)
+_global_qrs_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]], float]] = {}
+
+
+def reset_global_qrs_cache(instance_id: Optional[str] = None) -> None:
+    """Drop cached global-QRS results (all of them, or one instance's)."""
+    if instance_id is None:
+        _global_qrs_cache.clear()
+    else:
+        _global_qrs_cache.pop(instance_id, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRY POINT — calculate_all_ecg_metrics()
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1013,6 +1047,7 @@ def calculate_all_ecg_metrics(
         instance_id: Optional[str] = None,
         lead_i_data:   Optional[np.ndarray] = None,
         lead_avf_data: Optional[np.ndarray] = None,
+        all_lead_data: Optional[Dict[str, np.ndarray]] = None,
 ) -> Dict[str, Any]:
     """
     Calculate ALL ECG metrics from Lead II data in one call.
@@ -1035,6 +1070,12 @@ def calculate_all_ecg_metrics(
         instance_id:  Per-instance smoothing key.
         lead_i_data:  Lead I (optional, unused — kept for API compat).
         lead_avf_data:Lead aVF (optional, unused — kept for API compat).
+        all_lead_data:{lead name -> signal} for the multi-lead global QRS
+                      boundary. Every signal must be time-synchronised with
+                      lead_data and the same length. With two or more usable
+                      leads the QRS width is measured globally (earliest onset
+                      to latest offset across leads, Glasgow/Marquette style);
+                      otherwise the single-lead Curtin measurement is kept.
 
     Returns:
         Dict with keys:
@@ -1044,6 +1085,8 @@ def calculate_all_ecg_metrics(
           qrs_duration (int, ms)
           qt_interval  (float, ms)
           qtc_interval (int, ms)
+          qrs_method   (str, "global-multilead" or "single-lead")
+          qrs_leads_used (int, leads that contributed to the QRS width)
         Values are 0/None on failure.
     """
     results: Dict[str, Any] = {
@@ -1053,6 +1096,8 @@ def calculate_all_ecg_metrics(
         "qrs_duration": 0,
         "qt_interval":  None,
         "qtc_interval": 0,
+        "qrs_method":   "single-lead",
+        "qrs_leads_used": 1,
     }
 
     try:
@@ -1099,6 +1144,49 @@ def calculate_all_ecg_metrics(
             qrs_dur_int = int(round(qrs_dur_ms)) if qrs_dur_ms > 0 else 0
         except Exception:
             qrs_dur_int = 0
+
+        # ── Step 4b: multi-lead global QRS boundary (preferred when available) ─
+        # A single lead sees only its own projection of the depolarisation
+        # wavefront, so its onset is late and its offset early — Lead II alone
+        # reads 10-20 ms short. With the other leads in hand the width is taken
+        # from the earliest onset to the latest offset across the whole set.
+        if all_lead_data:
+            cache_key = instance_id or "_default"
+            now = time.monotonic()
+            cached = _global_qrs_cache.get(cache_key)
+            fresh = False
+
+            if cached is not None and (now - cached[0]) < cached[2]:
+                global_qrs = cached[1]
+            else:
+                try:
+                    global_qrs = compute_global_qrs_duration_12lead(
+                        all_lead_data, r_peaks, fs,
+                        adc_per_mv=1200.0, heart_rate=hr,
+                    )
+                except Exception as e:
+                    print(f" ⚠️ global QRS failed, keeping single-lead: {e}")
+                    global_qrs = None
+                elapsed = time.monotonic() - now
+                next_interval = min(
+                    _GLOBAL_QRS_MAX_REFRESH_SEC,
+                    max(_GLOBAL_QRS_REFRESH_SEC, elapsed / _GLOBAL_QRS_DUTY_CYCLE),
+                )
+                # A failure is cached too, so a lead set that cannot be
+                # delineated is not retried five times a second.
+                _global_qrs_cache[cache_key] = (now, global_qrs, next_interval)
+                fresh = True
+
+            if global_qrs and global_qrs["global_qrs_ms"] > 0:
+                qrs_dur_int = int(round(global_qrs["global_qrs_ms"]))
+                results["qrs_method"] = "global-multilead"
+                results["qrs_leads_used"] = global_qrs["leads_used"]
+                results["qrs_per_lead_ms"] = global_qrs["per_lead_qrs_ms"]
+                if fresh:
+                    # Sample indices point into a rolling buffer, so they are
+                    # only meaningful for the tick that measured them.
+                    results["qrs_global_onset"] = global_qrs["global_onset"]
+                    results["qrs_global_offset"] = global_qrs["global_offset"]
 
         if instance_id and qrs_dur_int > 0:
             qrs_dur_int = apply_interval_smoothing(qrs_dur_int, instance_id, _qrs_buffers)

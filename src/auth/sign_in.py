@@ -150,6 +150,15 @@ class SignIn:
         os.makedirs(os.path.dirname(USER_DATA_FILE), exist_ok=True)
         with open(USER_DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(self.users, f, indent=2)
+        # This file holds PBKDF2 password hashes. The default mode makes it
+        # readable by every account on the machine, which hands any other user
+        # an offline target to grind. Narrow it to the owner. Best-effort:
+        # on Windows the POSIX bits are largely advisory, and a failure here
+        # must not lose the write that already succeeded above.
+        try:
+            os.chmod(USER_DATA_FILE, 0o600)
+        except Exception:
+            pass
 
     @staticmethod
     def _normalize_phone(value: str) -> str:
@@ -373,6 +382,49 @@ class SignIn:
         email: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
+        # ── Input limits, enforced here rather than only at the forms ────────
+        # The UI validators are a typing convenience and are bypassed by any
+        # non-GUI caller. This check runs on every registration path, so an
+        # oversized or control-character-laden value cannot reach users.json,
+        # the cloud payload, or the PDF header no matter how it arrived.
+        try:
+            from utils.input_validation import (
+                validate_email, validate_name, validate_password,
+                validate_phone, validate_serial, validate_username,
+            )
+
+            ok, username, err = validate_username(username)
+            if not ok:
+                return False, err
+
+            ok, _cleaned, err = validate_password(password)
+            if not ok:
+                return False, err
+
+            if full_name:
+                ok, full_name, err = validate_name(full_name, "Full name")
+                if not ok:
+                    return False, err
+
+            if phone:
+                ok, phone, err = validate_phone(phone)
+                if not ok:
+                    return False, err
+
+            if email:
+                ok, email, err = validate_email(email, required=False)
+                if not ok:
+                    return False, err
+
+            if serial_id:
+                ok, serial_id, err = validate_serial(serial_id, required=False)
+                if not ok:
+                    return False, err
+        except ImportError:
+            # Validation module unavailable (stripped build) — fall through
+            # rather than blocking registration outright.
+            pass
+
         # If username already exists, allow update (overwrite) instead of blocking
         is_update = username in self.users
         if not is_update:
@@ -763,6 +815,26 @@ class LoginRegisterDialog(QDialog):
         if not fullname or not age or not gender or not contact or not email:
             QMessageBox.warning(self, "Error", "All details are required.")
             return
+
+        # Same shared limits as every other form in the app.
+        from utils.input_validation import (
+            validate_age, validate_email, validate_name, validate_password,
+            validate_phone, validate_username,
+        )
+        checks = (
+            validate_username(username),
+            validate_password(password),
+            validate_name(fullname, "Full name"),
+            validate_age(age, "Age"),
+            validate_name(gender, "Gender", min_length=1, max_length=20),
+            validate_phone(contact, "Contact number"),
+            validate_email(email),
+        )
+        for ok, _cleaned, err in checks:
+            if not ok:
+                QMessageBox.warning(self, "Error", err)
+                return
+        username, password, fullname, age, gender, contact, email = (c[1] for c in checks)
         ok, msg = self.sign_in_logic.register_user_with_details(
             username=username,
             password=password,

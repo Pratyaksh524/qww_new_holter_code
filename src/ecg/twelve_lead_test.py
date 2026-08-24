@@ -2282,6 +2282,53 @@ class ECGTestPage(QWidget):
             # Fallback: simple mean if moving average fails
             return np.nanmean(signal) if len(signal) > 0 else 0.0
 
+    def _build_global_qrs_lead_map(self, reference_length=None):
+        """Collect the connected, non-flat leads for the global QRS measurement.
+
+        The multi-lead boundary rule only holds if every signal shares Lead II's
+        sample clock, so leads whose buffer length differs are dropped rather
+        than resampled. A lead the connection tracker has marked off is dropped
+        too: its buffer is held flat at the ADC centre and would otherwise be
+        delineated as a spurious, very narrow complex.
+
+        Returns {lead name -> signal}; empty when fewer than two leads qualify,
+        which leaves the caller on the single-lead path.
+        """
+        lead_map = {}
+        try:
+            data = getattr(self, 'data', None)
+            leads = getattr(self, 'leads', None)
+            if not data or not leads:
+                return {}
+
+            conn_state = getattr(self, '_lead_connection_state', {}) or {}
+            off_state = getattr(self, '_lead_off_state', {}) or {}
+
+            for idx, lead_name in enumerate(leads):
+                if idx >= len(data):
+                    break
+                sig = data[idx]
+                if sig is None or len(sig) < 1000:
+                    continue
+                if reference_length is not None and len(sig) != reference_length:
+                    continue
+                if not conn_state.get(lead_name, True):
+                    continue
+                if off_state.get(lead_name, False):
+                    continue
+                arr = np.asarray(sig, dtype=float)
+                # Same flat-line gate the rest of the page uses (ADC counts).
+                if float(np.std(arr)) < 5.0:
+                    continue
+                lead_map[lead_name] = arr
+
+            if len(lead_map) < 2:
+                return {}
+        except Exception as e:
+            print(f" ⚠️ _build_global_qrs_lead_map failed: {e}")
+            return {}
+        return lead_map
+
     def calculate_ecg_metrics(self):
         """Calculate ECG metrics using median beat (GE/Philips standard).
         
@@ -2369,6 +2416,14 @@ class ECGTestPage(QWidget):
             for _buf in ('_pr_smooth_buffer_tl', '_qrs_smooth_buffer', '_qt_smooth_buffer'):
                 if hasattr(self, _buf):
                     getattr(self, _buf).clear()
+            # Drop the cached global-QRS result too, otherwise a width
+            # measured before the leads dropped can reappear for a few seconds
+            # once signal returns.
+            try:
+                from .ecg_calculations import reset_global_qrs_cache
+                reset_global_qrs_cache(getattr(self, '_instance_id', 'twelve_lead'))
+            except Exception:
+                pass
             try:
                 from .ui import display_updates as _du
                 for _key in (
@@ -2410,14 +2465,26 @@ class ECGTestPage(QWidget):
                 fs = float(self.sampler.sampling_rate)
             
         # Unified ECG metrics (HR, RR, PR, QRS, QT, QTc) — single source of truth
+        # Every connected lead is handed over so QRS width can be measured from
+        # the earliest onset to the latest offset across the lead set instead of
+        # from Lead II alone (which reads 10-20 ms short).
+        global_qrs_leads = self._build_global_qrs_lead_map(
+            reference_length=len(lead_ii_data)
+        )
         try:
             user_metrics = calculate_all_ecg_metrics(
                 lead_ii_data, fs,
                 instance_id=getattr(self, '_instance_id', 'twelve_lead'),
+                all_lead_data=global_qrs_leads or None,
             )
         except Exception as e:
             print(f"Error in calculate_all_ecg_metrics: {e}")
             user_metrics = {k: None for k in ["heart_rate", "rr_interval", "pr_interval", "qrs_duration", "qt_interval", "qtc_interval"]}
+
+        # Remember how the QRS was measured so the report and the metric tooltip
+        # can say so rather than implying a single-lead number is a global one.
+        self.last_qrs_method = user_metrics.get("qrs_method", "single-lead")
+        self.last_qrs_leads_used = int(user_metrics.get("qrs_leads_used", 1) or 1)
         
         # DUAL-PATH ECG ARCHITECTURE (Clinical Standard):
         # 1. DISPLAY CHANNEL (0.5-40 Hz): Used for R-peak detection only
@@ -2854,7 +2921,16 @@ class ECGTestPage(QWidget):
             median_beat_ii, time_axis, fs, tp_baseline_ii
         ) or 0
         
-        if user_metrics_qrs > 0 and median_beat_qrs > 0:
+        _global_qrs_used = (
+            getattr(self, 'last_qrs_method', 'single-lead') == 'global-multilead'
+        )
+
+        if _global_qrs_used and user_metrics_qrs > 0:
+            # The global boundary already spans every connected lead. Blending a
+            # Lead-II median-beat width back in would drag it toward the very
+            # single-lead under-estimate the global rule exists to correct.
+            qrs_duration_raw = user_metrics_qrs
+        elif user_metrics_qrs > 0 and median_beat_qrs > 0:
             # If median_beat_qrs is unstable or contaminated by T-wave tail (>15ms difference),
             # trust user_metrics_qrs (Curtin 2018) to prevent QRS value jumping.
             if abs(median_beat_qrs - user_metrics_qrs) <= 15:
@@ -2868,7 +2944,13 @@ class ECGTestPage(QWidget):
             self._qrs_print_count = 0
         self._qrs_print_count += 1
         if self._qrs_print_count % 30 == 0:
-            print(f" ✓ QRS: {qrs_duration_raw} ms (raw_curtin={user_metrics_qrs}, median_beat={median_beat_qrs})")
+            if _global_qrs_used:
+                _leads = getattr(self, 'last_qrs_leads_used', 1)
+                print(f" ✓ QRS: {qrs_duration_raw} ms "
+                      f"(global multi-lead boundary, {_leads} leads, "
+                      f"lead-II-only={median_beat_qrs} ms)")
+            else:
+                print(f" ✓ QRS: {qrs_duration_raw} ms (raw_curtin={user_metrics_qrs}, median_beat={median_beat_qrs})")
         
         # Hold last good QRS if current frame fails
         if qrs_duration_raw is None or qrs_duration_raw <= 0:
@@ -2919,6 +3001,20 @@ class ECGTestPage(QWidget):
                     self._pending_qrs_start_time = current_time
         
         self.last_qrs_duration = self._last_displayed_qrs
+
+        # Say which measurement the number came from — a global width and a
+        # Lead-II width are different claims and should not look identical.
+        try:
+            from .qrs_detection import describe_qrs_method
+            if 'qrs_duration' in self.metric_labels:
+                self.metric_labels['qrs_duration'].setToolTip(
+                    describe_qrs_method(
+                        getattr(self, 'last_qrs_method', 'single-lead'),
+                        getattr(self, 'last_qrs_leads_used', 1),
+                    )
+                )
+        except Exception:
+            pass
         
         # REAL MODE: Calculate QT Interval from median beat using clinical tangent method
         qt_interval_raw = measure_qt_from_median_beat(median_beat_ii, time_axis, fs, tp_baseline_ii, rr_ms=rr_ms)

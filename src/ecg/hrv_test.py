@@ -1926,6 +1926,14 @@ class HRVTestWindow(QWidget):
                 for _buf in ('_pr_smooth_buffer_tl', '_qrs_smooth_buffer', '_qt_smooth_buffer'):
                     if hasattr(self.ecg_calculator, _buf):
                         getattr(self.ecg_calculator, _buf).clear()
+                # Drop the cached global-QRS result too, otherwise a width
+                # measured before the leads dropped can reappear for a few seconds
+                # once signal returns.
+                try:
+                    from .ecg_calculations import reset_global_qrs_cache
+                    reset_global_qrs_cache(getattr(self.ecg_calculator, '_instance_id', 'hrv_test'))
+                except Exception:
+                    pass
             self.last_heart_rate = 0
             self._last_displayed_bpm = 0
             # Show the lead-off warning label (same as 12-lead)
@@ -2089,6 +2097,18 @@ class HRVTestWindow(QWidget):
                     qrs_text = self.metric_labels['qrs_duration'].text().strip()
                     if qrs_text and not qrs_text.endswith("ms"):
                         self.metric_labels['qrs_duration'].setText(f"{qrs_text} ms")
+                    # The width comes from the shared 12-lead calculator, which
+                    # measures it globally whenever two or more leads are live.
+                    try:
+                        from .qrs_detection import describe_qrs_method
+                        self.metric_labels['qrs_duration'].setToolTip(
+                            describe_qrs_method(
+                                getattr(self.ecg_calculator, 'last_qrs_method', 'single-lead'),
+                                getattr(self.ecg_calculator, 'last_qrs_leads_used', 1),
+                            )
+                        )
+                    except Exception:
+                        pass
                 if 'qtc_interval' in self.metric_labels:
                     qtqtc_text = self.metric_labels['qtc_interval'].text().strip()
                     if qtqtc_text and not qtqtc_text.endswith("ms"):

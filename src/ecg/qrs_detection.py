@@ -1107,6 +1107,256 @@ def qrs_duration_from_raw_signal(lead_data: np.ndarray,
     return qrs_ms
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-LEAD GLOBAL QRS BOUNDARY  (Glasgow / Marquette style)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Single-lead delineation systematically UNDER-estimates QRS width: the earliest
+# deflection and the latest return-to-baseline rarely happen in the same lead, so
+# a Lead-II-only measurement typically reads 10-20 ms short of the true width.
+#
+# The fix is the boundary rule every 12-lead cart uses:
+#
+#     global onset  = earliest QRS onset  across the leads   (per beat)
+#     global offset = latest   QRS offset across the leads   (per beat)
+#     QRS duration  = global offset - global onset
+#
+# Taken literally ("earliest" = min, "latest" = max) one noisy lead out of twelve
+# inflates every beat, so the extremes are replaced by the 15th/85th percentile —
+# still the outer edge of the lead ensemble, but immune to one or two bad leads.
+# Across beats the MEDIAN is used, so an ectopic beat cannot drag the result.
+#
+# Reference: Rijnbeek et al. (2014), "Normal values of the electrocardiogram for
+# ages 16-90 years", J Electrocardiol 47:914-921 — validates the global-boundary
+# approach against the CSE database.
+# ══════════════════════════════════════════════════════════════════════════════
+
+GLOBAL_QRS_MIN_LEADS: int = 2       # below this, fall back to single-lead
+GLOBAL_QRS_ONSET_PERCENTILE: float = 15.0
+GLOBAL_QRS_OFFSET_PERCENTILE: float = 85.0
+GLOBAL_QRS_MAX_BEATS: int = 8       # beats delineated per lead (cost guard)
+GLOBAL_QRS_FLAT_MV: float = 0.05    # peak-to-peak below this -> lead is flat
+
+
+def _bandpass_for_global_qrs(signal: np.ndarray, fs: float) -> np.ndarray:
+    """0.5-40 Hz analysis band — the same band the Lead II path is measured in.
+
+    Every lead must go through an identical filter, otherwise the phase response
+    differs between leads and the onset/offset positions stop being comparable.
+    """
+    try:
+        nyq = fs / 2.0
+        low = max(0.5 / nyq, 1e-4)
+        high = min(40.0 / nyq, 0.99)
+        centred = np.asarray(signal, dtype=float)
+        centred = centred - float(np.mean(centred))
+        if high <= low or centred.size < 30:
+            return centred
+        b, a = butter(2, [low, high], btype="band")
+        return filtfilt(b, a, centred)
+    except Exception:
+        centred = np.asarray(signal, dtype=float)
+        return centred - float(np.mean(centred))
+
+
+def _curtin_beat_borders(lead_data: np.ndarray,
+                         r_idx: int,
+                         fs: float,
+                         adc_per_mv: float,
+                         heart_rate: int
+                         ) -> Optional[Tuple[int, int]]:
+    """One beat, one lead -> (onset, offset) as ABSOLUTE sample indices.
+
+    Same two-pass Curtin border search as qrs_duration_from_raw_signal(), but it
+    returns the border positions instead of collapsing them to a duration — the
+    global rule has to compare positions across leads, not widths.
+    """
+    if heart_rate >= 150:
+        slope_mul = 1.30
+    elif heart_rate >= 120:
+        slope_mul = 1.08
+    elif heart_rate >= 75:
+        slope_mul = 1.10
+    else:
+        slope_mul = 2.20
+
+    def _measure(pre_ms_loc: float, post_ms_loc: float):
+        ws = max(0, r_idx - int(pre_ms_loc / 1000.0 * fs))
+        we = min(len(lead_data), r_idx + int(post_ms_loc / 1000.0 * fs))
+        seg = np.array(lead_data[ws:we], dtype=float)
+        if len(seg) < 20:
+            return None, seg, None
+        bl = min(len(seg), int(0.03 * fs))
+        seg -= float(np.mean(seg[:max(1, bl)]))
+        rp = find_reference_peak(seg, 0, len(seg))
+        if abs(seg[rp]) < 1e-9:
+            return None, seg, None
+        sp_loc = find_significant_peaks(seg, rp, 0, len(seg), fs)
+        sp_loc = remove_peak_outliers_by_spacing(sp_loc, fs)
+        if not sp_loc:
+            return None, seg, None
+        effective_adc = max(abs(seg[rp]), adc_per_mv / 5.0)
+        on, off = delineate_channel_borders(
+            seg, sp_loc, rp, 0, len(seg), fs, effective_adc * slope_mul)
+        if on is None or off is None:
+            return None, seg, None
+        return (ws + on, ws + off), seg, off
+
+    # Pass 1 — narrow window: correct for a normal-width complex.
+    borders, seg1, off1 = _measure(80.0, 80.0)
+
+    # A complex that runs into the edge of the narrow segment is still going:
+    # widen the window so BBB terminal forces are not clipped.
+    hits_boundary = off1 is not None and len(seg1) > 0 and off1 >= len(seg1) - 3
+    if hits_boundary:
+        wide, _, _ = _measure(120.0, 160.0)
+        if wide is not None:
+            borders = wide
+
+    if borders is None:
+        return None
+
+    on_abs, off_abs = borders
+    dur_ms = (off_abs - on_abs) / fs * 1000.0
+    if not (QRS_DURATION_MIN_MS <= dur_ms <= QRS_DURATION_MAX_MS):
+        return None
+    return int(on_abs), int(off_abs)
+
+
+def compute_global_qrs_duration_12lead(
+        lead_signals: Dict[str, np.ndarray],
+        r_peaks,
+        fs: float = 500.0,
+        adc_per_mv: float = 1200.0,
+        heart_rate: int = 75,
+        min_leads: int = GLOBAL_QRS_MIN_LEADS,
+        max_beats: int = GLOBAL_QRS_MAX_BEATS,
+        flat_threshold: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Global QRS duration measured across every supplied lead.
+
+    All leads must be time-synchronised and share Lead II's sample clock — the
+    R-peaks detected on Lead II are reused as the per-beat anchor for every lead,
+    which is what makes the onsets and offsets directly comparable.
+
+    Args:
+        lead_signals:   {lead name -> raw signal}. Flat/short leads are dropped.
+        r_peaks:        R-peak sample indices detected on Lead II.
+        fs:             Sampling rate (Hz).
+        adc_per_mv:     ADC counts per mV, for the slope threshold.
+        heart_rate:     BPM, selects the HR-adaptive slope multiplier.
+        min_leads:      Below this many usable leads, returns None so the caller
+                        falls back to its single-lead measurement.
+        max_beats:      Beats delineated per lead.
+        flat_threshold: Peak-to-peak below which a lead counts as flat. Defaults
+                        to 0.05 mV expressed in the signal's own units.
+
+    Returns:
+        dict(global_qrs_ms, global_onset, global_offset, leads_used, leads_total,
+             beats_used, per_lead_qrs_ms) or None when the measurement fails.
+    """
+    try:
+        peaks = np.asarray(r_peaks, dtype=int)
+        if peaks.size < 2 or not lead_signals:
+            return None
+
+        if flat_threshold is None:
+            flat_threshold = GLOBAL_QRS_FLAT_MV * float(adc_per_mv)
+
+        # Beats nearest the middle of the buffer are the best conditioned: the
+        # filter edges at either end of the window distort the outer complexes.
+        if peaks.size > max_beats:
+            mid = peaks.size // 2
+            start = max(0, mid - max_beats // 2)
+            peaks = peaks[start:start + max_beats]
+
+        min_len = int(2.0 * fs)
+        beat_onsets = [[] for _ in range(peaks.size)]
+        beat_offsets = [[] for _ in range(peaks.size)]
+        per_lead_qrs = {}
+        leads_used = 0
+
+        for lead_name, raw in lead_signals.items():
+            sig = np.asarray(raw, dtype=float)
+            if sig.size < min_len:
+                continue
+            if float(np.max(sig) - np.min(sig)) < flat_threshold:
+                continue          # flat / disconnected lead
+
+            filt = _bandpass_for_global_qrs(sig, fs)
+
+            lead_widths = []
+            for beat_i, r_idx in enumerate(peaks):
+                if r_idx < 0 or r_idx >= filt.size:
+                    continue
+                borders = _curtin_beat_borders(
+                    filt, int(r_idx), fs, adc_per_mv, heart_rate)
+                if borders is None:
+                    continue
+                on_abs, off_abs = borders
+                beat_onsets[beat_i].append(on_abs)
+                beat_offsets[beat_i].append(off_abs)
+                lead_widths.append((off_abs - on_abs) / fs * 1000.0)
+
+            if lead_widths:
+                leads_used += 1
+                per_lead_qrs[lead_name] = round(float(np.median(lead_widths)), 1)
+
+        if leads_used < min_leads:
+            return None
+
+        # Per beat: the outer edge of the lead ensemble, trimmed of outliers.
+        global_onsets = []
+        global_offsets = []
+        for beat_i in range(peaks.size):
+            onsets = beat_onsets[beat_i]
+            offsets = beat_offsets[beat_i]
+            if not onsets or not offsets:
+                continue
+            global_onsets.append(
+                float(np.percentile(onsets, GLOBAL_QRS_ONSET_PERCENTILE)))
+            global_offsets.append(
+                float(np.percentile(offsets, GLOBAL_QRS_OFFSET_PERCENTILE)))
+
+        if not global_onsets:
+            return None
+
+        # Across beats: median, so one ectopic beat cannot move the result.
+        med_onset = float(np.median(global_onsets))
+        med_offset = float(np.median(global_offsets))
+        qrs_ms = (med_offset - med_onset) / fs * 1000.0
+        if not (QRS_DURATION_MIN_MS <= qrs_ms <= QRS_DURATION_MAX_MS):
+            return None
+
+        return {
+            "global_qrs_ms":   round(qrs_ms, 1),
+            "global_onset":    int(round(med_onset)),
+            "global_offset":   int(round(med_offset)),
+            "leads_used":      leads_used,
+            "leads_total":     len(lead_signals),
+            "beats_used":      len(global_onsets),
+            "per_lead_qrs_ms": per_lead_qrs,
+        }
+
+    except Exception as e:
+        print(f" ⚠️ compute_global_qrs_duration_12lead error: {e}")
+        return None
+
+
+def describe_qrs_method(method: str, leads_used: int = 1) -> str:
+    """One-line provenance for a QRS width, for tooltips and report footers.
+
+    The number alone is ambiguous — 96 ms measured on Lead II and 96 ms measured
+    across twelve leads are different claims — so anywhere the width is shown
+    should be able to say which one it is.
+    """
+    if method == "global-multilead" and leads_used >= 2:
+        return (f"Global QRS: earliest onset to latest offset across "
+                f"{leads_used} leads (Glasgow/Marquette rule).")
+    return "Single-lead QRS: measured on Lead II only (Curtin 2018)."
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SELF-TEST
 # ══════════════════════════════════════════════════════════════════════════════

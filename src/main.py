@@ -1405,6 +1405,7 @@ class LoginRegisterDialog(QDialog):
         self.login_email = QLineEdit()
         self.login_email.setPlaceholderText("Full Name or Phone Number (from signup)")
         self.login_email.setMinimumHeight(44)
+        self.login_email.setMaxLength(20)
 
         password_row = QHBoxLayout()
         password_row.setSpacing(10)
@@ -1779,6 +1780,16 @@ class LoginRegisterDialog(QDialog):
         scroll.setWidget(widget)
         return scroll
 
+    def _login_limiter(self):
+        """Per-window failed-sign-in counter, created on first use."""
+        try:
+            if getattr(self, "_login_rate_limiter", None) is None:
+                from utils.input_validation import LoginRateLimiter
+                self._login_rate_limiter = LoginRateLimiter()
+            return self._login_rate_limiter
+        except Exception:
+            return None
+
     def handle_login(self):
         identifier = self.login_email.text().strip()
         password_or_serial = self.login_password.text()
@@ -1787,6 +1798,22 @@ class LoginRegisterDialog(QDialog):
                 self,
                 "Login Required",
                 "Please enter your full name or phone number, and the password you used at signup.",
+            )
+            return
+
+        # Throttle repeated failures. The OTP path already locked after 3 tries;
+        # the password path counted nothing, so the form would accept guesses as
+        # fast as they could be typed. This bounds guessing at the UI, which is
+        # the attack this application can actually see — it is not a substitute
+        # for the PBKDF2 work factor protecting users.json on disk.
+        limiter = self._login_limiter()
+        if limiter is not None and limiter.is_locked(identifier):
+            wait_s = limiter.seconds_remaining(identifier)
+            QMessageBox.warning(
+                self,
+                "Too Many Attempts",
+                "Too many failed sign-in attempts for this account.\n\n"
+                f"Try again in {max(1, wait_s // 60)} minute(s).",
             )
             return
 
@@ -2028,6 +2055,8 @@ class LoginRegisterDialog(QDialog):
         # result is None and login is denied rather than granted.
         _cred_done.wait(timeout=20.0)
         if _cred_ok[0]:
+            if limiter is not None:
+                limiter.record_success(identifier)
             found = self.sign_in_logic._find_user_record(identifier)
             if found:
                 username, record = found
@@ -2041,13 +2070,30 @@ class LoginRegisterDialog(QDialog):
                 self.user_details = {}
                 self.accept()
         else:
-            QMessageBox.warning(
-                self,
-                "Login Failed",
-                "Invalid full name / phone number or password.\n\n"
-                "Use the same full name or phone number and password you entered at signup. "
-                "Internet is not required for sign-in.",
-            )
+            locked_now = limiter.record_failure(identifier) if limiter is not None else False
+            # The wording never distinguishes a wrong identifier from a wrong
+            # password. Telling them apart would turn this form into an account
+            # enumeration oracle for anyone with access to the machine.
+            if locked_now:
+                QMessageBox.warning(
+                    self,
+                    "Too Many Attempts",
+                    "Too many failed sign-in attempts for this account.\n\n"
+                    f"Sign-in is locked for {max(1, limiter.lockout_seconds // 60)} minute(s).",
+                )
+            else:
+                remaining = limiter.attempts_remaining(identifier) if limiter is not None else 0
+                tail = (
+                    f"\n\n{remaining} attempt(s) remaining before sign-in is locked."
+                    if remaining else ""
+                )
+                QMessageBox.warning(
+                    self,
+                    "Login Failed",
+                    "Invalid full name / phone number or password.\n\n"
+                    "Use the same full name or phone number and password you entered at signup. "
+                    "Internet is not required for sign-in." + tail,
+                )
 
     def _upsert_phone_login_user(self, phone: str, token: str):
         from datetime import datetime
@@ -2439,12 +2485,37 @@ class LoginRegisterDialog(QDialog):
         if not all([name, doctor, org_name, org_address, phone, password, confirm]):
             QMessageBox.warning(self, "Error", "All fields are required.")
             return
-        # Enforce numeric phone number with exact 10 digits
-        if not phone.isdigit() or len(phone) != 10:
-            QMessageBox.warning(self, "Error", "Phone number must be exactly 10 digits.")
-            return
+
+        # Shared limits (src/utils/input_validation.py). The phone was already
+        # checked here; the name, doctor, organisation and address fields were
+        # not bounded at all, so an arbitrarily long or control-character-laden
+        # value could reach users.json, the cloud payload and the PDF header.
+        from utils.input_validation import (
+            validate_name, validate_password, validate_phone, validate_text,
+            validate_serial, ADDRESS_MAX_LENGTH, ORG_NAME_MAX_LENGTH,
+        )
+
+        checks = (
+            validate_name(name, "Name"),
+            validate_name(doctor, "Doctor name"),
+            validate_name(org_name, "Organisation name", max_length=ORG_NAME_MAX_LENGTH),
+            validate_text(org_address, "Organisation address", ADDRESS_MAX_LENGTH),
+            validate_phone(phone, "Phone number"),
+            validate_serial(serial_id, "Serial ID", required=False),
+        )
+        for ok, _cleaned, err in checks:
+            if not ok:
+                QMessageBox.warning(self, "Error", err)
+                return
+        name, doctor, org_name, org_address, phone, serial_id = (c[1] for c in checks)
+
         if password != confirm:
             QMessageBox.warning(self, "Error", "Passwords do not match.")
+            return
+
+        ok_pwd, password, err_pwd = validate_password(password)
+        if not ok_pwd:
+            QMessageBox.warning(self, "Error", err_pwd)
             return
 
         # Show non-blocking translucent loading overlay dialog

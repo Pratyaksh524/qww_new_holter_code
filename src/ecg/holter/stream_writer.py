@@ -127,7 +127,19 @@ class HolterStreamWriter:
     def start(self) -> str:
         """Creates session directory + .ecgh file. Returns session directory path."""
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        patient_name = self.patient_info.get('name', 'Unknown').replace(' ', '_')
+        # Replacing spaces is not enough: a name of '../../../Users/Public/x'
+        # walks out of output_dir once os.path.join and normpath are done with
+        # it. The shared sanitiser strips every character that could form a
+        # path separator or a traversal sequence.
+        try:
+            from utils.input_validation import sanitize_filename_component
+            patient_name = sanitize_filename_component(
+                self.patient_info.get('name', 'Unknown'), fallback='Unknown')
+        except Exception:
+            import re as _re
+            patient_name = _re.sub(
+                r'[^A-Za-z0-9_\-]', '_',
+                str(self.patient_info.get('name', 'Unknown'))) or 'Unknown'
         self._session_dir = os.path.join(self.output_dir, f"{ts}_{patient_name}")
         os.makedirs(self._session_dir, exist_ok=True)
 

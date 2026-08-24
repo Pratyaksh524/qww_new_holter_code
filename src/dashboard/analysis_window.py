@@ -230,6 +230,9 @@ class InteractiveLeadCanvas(FigureCanvas):
         if xd is None:
             return
 
+        if not self.parent_window.lead_has_visible_data(self.lead_name):
+            return
+
         if event.button == 1:  # Left click
             if tool == TOOL_SELECT:
                 self.expand_requested.emit(self.lead_name)
@@ -2018,7 +2021,15 @@ class ECGAnalysisWindow(QDialog):
         self.mobile_no_input = QLineEdit()
         self.mobile_no_input.setObjectName("mobile_input")
         self.mobile_no_input.setPlaceholderText("XXXXXXXXXX")
-        self.mobile_no_input.setMaxLength(10)
+        # Digits only, at most ten. setMaxLength alone capped the length but
+        # still accepted letters, so "12ab34cd56" could be typed and then
+        # silently normalised to six digits before the length check rejected it
+        # with a message that did not match what the user saw in the box.
+        try:
+            from utils.input_validation import apply_digit_only, PHONE_DIGITS
+            apply_digit_only(self.mobile_no_input, PHONE_DIGITS)
+        except Exception:
+            self.mobile_no_input.setMaxLength(10)
         self.mobile_no_input.setFixedWidth(170)
         mobile_lay.addWidget(self.mobile_no_input, 0, Qt.AlignRight)
 
@@ -2066,9 +2077,17 @@ class ECGAnalysisWindow(QDialog):
 
     def load_mobile_reports(self):
         """Load list of public reports by mobile number and show selection dialog."""
-        mobile_no = self._normalize_mobile_no(self.mobile_no_input.text().strip() if hasattr(self, "mobile_no_input") else "")
-        if len(mobile_no) != 10:
-            QMessageBox.warning(self, "Mobile", "Enter a valid 10-digit mobile number.")
+        raw_mobile = self.mobile_no_input.text().strip() if hasattr(self, "mobile_no_input") else ""
+        # Checked again here, not just at the widget: the validator above only
+        # governs typing, and this value goes on to build a cloud API request.
+        try:
+            from utils.input_validation import validate_phone
+            ok, mobile_no, err = validate_phone(raw_mobile, "Mobile number")
+        except Exception:
+            mobile_no = self._normalize_mobile_no(raw_mobile)
+            ok, err = len(mobile_no) == 10, "Enter a valid 10-digit mobile number."
+        if not ok:
+            QMessageBox.warning(self, "Mobile", err)
             return
 
         from utils.offline_queue import get_offline_queue
